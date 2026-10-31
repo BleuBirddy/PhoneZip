@@ -3,7 +3,8 @@
 # PhoneZip
 
 An iPhone app that copies your photos, videos and documents into one zip
-file, so you can move everything off the phone in one go.
+file, unzips it onto a USB drive, checks every file, and then (if you say
+so) deletes the originals from the phone.
 
 ## Why it exists
 
@@ -35,6 +36,8 @@ iPhone Export 2026-10-30 20.17.zip
 ├── Photos/
 │   ├── 2024/2024-05/IMG_0001.HEIC
 │   ├── 2024/2024-05/IMG_0001.MOV      ← the Live Photo video, same name
+│   ├── 2024/2024-06/IMG_0042.JPG      ← an edited photo, as it looks in Photos
+│   ├── 2024/2024-06/IMG_0042 (original).HEIC   ← and its untouched original
 │   └── Undated/...
 ├── Files/
 │   ├── On My iPhone/...               ← each picked folder, subfolders kept
@@ -43,9 +46,10 @@ iPhone Export 2026-10-30 20.17.zip
 ```
 
 - **Photos and videos:** the whole library, oldest first, filed by the month
-  they were taken. Edited photos are exported as you see them in Photos (with
-  the original's file name), Live Photos include their video, and hidden
-  photos are included. Photos kept only in iCloud ("Optimize iPhone Storage")
+  they were taken. Edited photos and videos are exported as you see them in
+  Photos, plus their untouched original (`… (original).HEIC`), so nothing is
+  lost if the phone's copy is deleted later. Live Photos include their video,
+  RAW+JPEG pairs include the RAW, and hidden photos are included. Photos kept only in iCloud ("Optimize iPhone Storage")
   are downloaded during the export.
 - **Documents:** iOS never lets an app read every file on the phone. Instead
   you pick folders in the Files picker (On My iPhone, iCloud Drive, ...) and
@@ -62,25 +66,48 @@ iPhone Export 2026-10-30 20.17.zip
 2. Turn Photos / Videos on or off, and tap **Add Folder…** for any documents.
 3. Tap **Create Zip**. Keep the app open and the phone plugged in; the screen
    stays on while it works, and **Cancel** stops it and deletes the partial zip.
-4. When it's done, the zip is in **Files › On My iPhone › PhoneZip** (it is
-   also listed under Saved Zips, with a Share button).
-5. Move it off the phone (see below), check it opens, then swipe to delete it
-   in PhoneZip.
+4. When it's done, plug in your USB drive and tap **Move to Drive…**. Choose
+   the drive (or a folder on it) under Locations. PhoneZip remembers it, so
+   next time the button reads **Move to *drive name*** as soon as it's
+   plugged in.
+5. PhoneZip unzips everything into a folder named after the export
+   (`iPhone Export 2026-10-30 20.17/`) and reads every file back from the
+   drive to check it. If all files match, the zip on the phone is removed.
+6. You see what was copied and checked. Tap **Delete Originals from
+   iPhone…** to free up the phone, or **Keep Them**. PhoneZip shows exactly
+   what will be deleted and asks first; iOS then asks again before deleting
+   photos.
 
-### Moving the zip to a NAS with a USB drive
+You can also skip the drive: the zip stays in **Files › On My iPhone ›
+PhoneZip** (and under Saved Zips, with a Share button) to move another way.
 
-- Format the drive as **exFAT**. FAT32 can't hold files over 4 GB, so a big
-  export would fail partway through the copy. Most NAS USB ports read exFAT
-  (on Synology it may need enabling in Package Center).
-- Plug the drive into the iPhone, open Files, long-press the zip under
-  On My iPhone › PhoneZip, choose **Move**, and pick the drive.
+### What deleting does
+
+- Only originals whose copy on the drive was read back and matched are
+  deleted. A photo is deleted only if *all* its files (edit, original, Live
+  Photo video, RAW) matched. Anything that failed stays on the phone, along
+  with the zip.
+- Photos go to **Photos › Recently Deleted** for 30 days. The space comes back
+  only after that's emptied, and until then they can be recovered.
+- Documents go to Files' **Recently Deleted** where the location has one.
+- **If iCloud Photos is on, deleting from the phone also deletes from iCloud
+  and every other device.** The same goes for files picked from iCloud Drive.
+- Albums, favorites, captions and people tags aren't part of the copy.
+- A folder on the phone itself can't be chosen as the "drive": deleting the
+  originals after copying to the same phone would leave no copy anywhere else.
+
+### The USB drive
+
+- Format the drive as **exFAT**. FAT32 can't hold files over 4 GB. Most NAS
+  USB ports read exFAT (on Synology it may need enabling in Package Center),
+  so the drive can then go straight into the NAS.
+- It needs free space for everything in the export; PhoneZip checks before
+  starting and stops without deleting anything if it's too small.
 - Thumb drives and portable SSDs run on the phone's power; an older spinning
   hard drive may need a powered hub.
 - Speed depends on the phone: USB-C Pro models copy at USB 3 speed with a
-  USB 3 cable; other iPhones manage roughly 30–40 MB/s (about 45 minutes for
-  100 GB).
-- Alternative with a Mac: connect the iPhone by cable, open it in Finder,
-  go to **Files › PhoneZip** and drag the zip straight onto the NAS share.
+  USB 3 cable; other iPhones manage roughly 30–40 MB/s. Every file is also
+  read back to check it, so expect roughly twice the plain copy time.
 
 ### Limits
 
@@ -88,9 +115,13 @@ iPhone Export 2026-10-30 20.17.zip
   the size of everything being exported. The export stops with a message when
   less than 500 MB would be left.
 - **Stay in the app:** iOS pauses apps that leave the screen, which pauses the
+  export and the copy to the drive.
+- **The finished step doesn't survive closing the app:** Move to Drive and
+  Delete Originals are offered right after an export. If PhoneZip is closed in
+  between, the zip is still in Saved Zips, but deleting originals needs a new
   export.
-- **Not encrypted:** the zip is a full, readable copy of your photos and files.
-  Delete it from the phone (and the USB drive) once it's safe on the NAS.
+- **Not encrypted:** the zip and the drive copy are full, readable copies of
+  your photos and files. Keep the drive somewhere safe.
 
 ## How it works
 
@@ -117,7 +148,24 @@ The export runs in the background, one item at a time
    Windows.
 4. **Check space before every file**, and on failure or cancel delete the
    half-written zip. A new export never overwrites an earlier one: two exports
-   in the same minute become `… 20.17.zip` and `… 20.17 (2).zip`.
+   in the same minute become `… 20.17.zip` and `… 20.17 (2).zip`. While
+   building, it records where every file in the zip came from (which photo,
+   which document); only that record decides what can be deleted later.
+5. **Copy to the drive** ([`DriveTransfer.swift`](PhoneZip/DriveTransfer.swift)).
+   Entries are unzipped straight from the phone onto the drive (no copy of the
+   zip on the drive, which would need double the space). Each file is flushed
+   to the drive, then read back with the cache bypassed and compared with the
+   CRC-32 checksum and size stored in the zip. Entry paths that would escape
+   the export folder are refused. If the copy is cancelled or the drive fills
+   up, the half-finished folder is removed.
+6. **Delete originals.** Photos are deleted through PhotoKit, which shows its
+   own confirmation and moves them to Recently Deleted. Documents are moved to
+   Files' Recently Deleted, or deleted through a file coordinator where there
+   is none, so iCloud Drive stays in step.
+
+The drive is remembered with a bookmark of the folder you picked. iOS gives
+apps no list of attached drives; the Files picker is the only way in, and the
+bookmark keeps that permission for next time.
 
 ## Building and running
 
@@ -174,7 +222,8 @@ first).
 | Path | What it does |
 | --- | --- |
 | `PhoneZip/ContentView.swift` | The single screen: photo access, folder list, progress, finished zip, saved zips |
-| `PhoneZip/Exporter.swift` | Runs the export and writes the zip |
+| `PhoneZip/Exporter.swift` | Runs each step: the export, the copy to the drive, the clean-up |
+| `PhoneZip/DriveTransfer.swift` | Unzips onto the drive, checks every file, deletes checked originals |
 | `PhoneZip/PhotoSource.swift` | Reads the photo library through PhotoKit |
 | `PhoneZip/FolderSource.swift` | Reads folders picked in Files |
 | `PhoneZip/ExportItem.swift` | One item to export, and unique paths inside the zip |

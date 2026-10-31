@@ -10,6 +10,9 @@ enum PhotoSource {
     struct Item {
         let resource: PHAssetResource
         let pathInZip: String
+        /// Which photo this file belongs to, so the photo is only deleted from
+        /// the phone once every one of its files is safely on the drive.
+        let assetID: String
     }
 
     static func requestAccess() async -> PHAuthorizationStatus {
@@ -50,7 +53,8 @@ enum PhotoSource {
             let asset = assets.object(at: index)
             let folder = asset.creationDate.map { "Photos/" + folderFormat.string(from: $0) } ?? "Photos/Undated"
             for (resource, name) in exportResources(for: asset) {
-                result.append(Item(resource: resource, pathInZip: paths.unique("\(folder)/\(name)")))
+                result.append(Item(resource: resource, pathInZip: paths.unique("\(folder)/\(name)"),
+                                   assetID: asset.localIdentifier))
             }
         }
         return result
@@ -58,9 +62,11 @@ enum PhotoSource {
 
     /// Picks which stored files of an asset to export. Each asset can hold
     /// several (original, edited version, Live Photo video, RAW+JPEG pair...).
-    /// We export what the user sees in Photos: the edited version when there
-    /// is one, else the original, plus the Live Photo video. Edited files are
-    /// stored as "FullSizeRender.jpg", so they borrow the original's name.
+    /// We export what the user sees in Photos (the edited version when there
+    /// is one) plus the Live Photo video. Because the phone's copy may be
+    /// deleted afterwards, edited items also keep their untouched original
+    /// ("IMG_0001 (original).HEIC") and RAW+JPEG pairs keep the RAW. Edited
+    /// files are stored as "FullSizeRender.jpg", so they borrow the original's name.
     private static func exportResources(for asset: PHAsset) -> [(PHAssetResource, String)] {
         let all = PHAssetResource.assetResources(for: asset)
         func first(_ types: PHAssetResourceType...) -> PHAssetResource? {
@@ -72,18 +78,34 @@ enum PhotoSource {
         let original = first(.photo, .video, .alternatePhoto) ?? all.first
         let stem = ((original?.originalFilename ?? "Untitled") as NSString).deletingPathExtension
 
-        func named(_ resource: PHAssetResource) -> (PHAssetResource, String) {
+        func named(_ resource: PHAssetResource, suffix: String = "") -> (PHAssetResource, String) {
             let ext = (resource.originalFilename as NSString).pathExtension
-            return (resource, ext.isEmpty ? stem : "\(stem).\(ext)")
+            return (resource, ext.isEmpty ? stem + suffix : "\(stem)\(suffix).\(ext)")
         }
 
         var picked: [(PHAssetResource, String)] = []
         switch asset.mediaType {
         case .image:
-            if let main = first(.fullSizePhoto, .photo) { picked.append(named(main)) }
-            if let live = first(.fullSizePairedVideo, .pairedVideo) { picked.append(named(live)) }
+            if let edited = first(.fullSizePhoto) {
+                picked.append(named(edited))
+                if let original = first(.photo) { picked.append(named(original, suffix: " (original)")) }
+            } else if let main = first(.photo) {
+                picked.append(named(main))
+            }
+            if let edited = first(.fullSizePairedVideo) {
+                picked.append(named(edited))
+                if let original = first(.pairedVideo) { picked.append(named(original, suffix: " (original)")) }
+            } else if let live = first(.pairedVideo) {
+                picked.append(named(live))
+            }
+            if let raw = first(.alternatePhoto) { picked.append(named(raw)) }
         case .video:
-            if let main = first(.fullSizeVideo, .video) { picked.append(named(main)) }
+            if let edited = first(.fullSizeVideo) {
+                picked.append(named(edited))
+                if let original = first(.video) { picked.append(named(original, suffix: " (original)")) }
+            } else if let main = first(.video) {
+                picked.append(named(main))
+            }
         default:
             break
         }

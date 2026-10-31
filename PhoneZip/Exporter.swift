@@ -2,25 +2,44 @@ import Foundation
 import UIKit
 import ZIPFoundation
 
-/// Builds the zip one file at a time: copy a photo to a temp file, add it,
+/// Runs the whole job, one step after another:
+/// 1. build the zip on the phone,
+/// 2. unzip it onto an external drive and check every file,
+/// 3. after the user confirms, delete the checked originals from the phone.
+///
+/// The zip is built one file at a time: copy a photo to a temp file, add it,
 /// delete the temp file. Peak extra space is the zip itself plus one item,
 /// never a second full copy of the library.
 @MainActor
 final class Exporter: ObservableObject {
+    struct Result {
+        let zip: URL
+        let bytes: Int64
+        let skipped: Int
+        let manifest: ExportManifest
+    }
+
     enum State {
         case idle
         case preparing
         case running(done: Int, total: Int, current: String)
-        case finished(zip: URL, bytes: Int64, skipped: Int)
+        case finished(Result)
+        case moving(done: Int, total: Int, current: String)
+        case moved(Result, DriveCopy)
+        case deleting
+        case cleaned(DeleteReport)
         case failed(String)
     }
 
     @Published private(set) var state: State = .idle
+    /// A problem to show without leaving the current step (e.g. the drive
+    /// filled up, so the user can try another drive).
+    @Published var notice: String?
     private var task: Task<Void, Never>?
 
     var isBusy: Bool {
         switch state {
-        case .preparing, .running: true
+        case .preparing, .running, .moving, .deleting: true
         default: false
         }
     }
@@ -35,10 +54,10 @@ final class Exporter: ObservableObject {
         task = Task.detached(priority: .userInitiated) { [weak self] in
             let outcome: State
             do {
-                let (zip, bytes, skipped) = try await Self.run(photos: photos, videos: videos, folders: folders) { done, total, current in
+                let result = try await Self.run(photos: photos, videos: videos, folders: folders) { done, total, current in
                     Task { @MainActor in self?.state = .running(done: done, total: total, current: current) }
                 }
-                outcome = .finished(zip: zip, bytes: bytes, skipped: skipped)
+                outcome = .finished(result)
             } catch is CancellationError {
                 outcome = .idle
             } catch {
@@ -48,6 +67,45 @@ final class Exporter: ObservableObject {
                 UIApplication.shared.isIdleTimerDisabled = false
                 self?.state = outcome
             }
+        }
+    }
+
+    /// Unzips the finished export onto the drive and checks every file.
+    /// `drive` is held until the copy ends so its access stays open.
+    func move(_ result: Result, to drive: PickedFolder) {
+        state = .moving(done: 0, total: 0, current: "")
+        UIApplication.shared.isIdleTimerDisabled = true
+
+        task = Task.detached(priority: .userInitiated) { [weak self] in
+            let outcome: State
+            var problem: String?
+            do {
+                let copy = try DriveTransfer.copy(zip: result.zip, onto: drive) { done, total, current in
+                    Task { @MainActor in self?.state = .moving(done: done, total: total, current: current) }
+                }
+                outcome = .moved(result, copy)
+            } catch is CancellationError {
+                outcome = .finished(result)
+            } catch {
+                // Back to the finished step: the zip is still on the phone,
+                // so another drive can be tried.
+                outcome = .finished(result)
+                problem = error.localizedDescription
+            }
+            await MainActor.run {
+                UIApplication.shared.isIdleTimerDisabled = false
+                self?.state = outcome
+                self?.notice = problem
+            }
+        }
+    }
+
+    /// Deletes from the phone only what the drive copy proved it has.
+    func deleteOriginals(_ result: Result, copy: DriveCopy) {
+        state = .deleting
+        task = Task { [weak self] in
+            let report = await DriveTransfer.deleteOriginals(result.manifest, verified: copy.verified)
+            self?.state = .cleaned(report)
         }
     }
 
@@ -68,7 +126,7 @@ final class Exporter: ObservableObject {
 
     static let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
 
-    // MARK: - Work (off the main thread)
+    // MARK: - Building the zip (off the main thread)
 
     struct OutOfSpace: LocalizedError {
         var errorDescription: String? {
@@ -82,7 +140,7 @@ final class Exporter: ObservableObject {
     private nonisolated static func run(
         photos: Bool, videos: Bool, folders: [PickedFolder],
         progress: @escaping (Int, Int, String) -> Void
-    ) async throws -> (URL, Int64, Int) {
+    ) async throws -> Result {
         var paths = ZipPathAllocator()
         var items = PhotoSource.items(photos: photos, videos: videos, paths: &paths).map(ExportItem.photoResource)
         items += FolderSource.items(in: folders, paths: &paths)
@@ -112,6 +170,7 @@ final class Exporter: ObservableObject {
 
         let archive = try Archive(url: zipURL, accessMode: .create)
         var skipped: [String] = []
+        var manifest = ExportManifest()
 
         for (index, item) in items.enumerated() {
             try Task.checkCancellation()
@@ -126,9 +185,11 @@ final class Exporter: ObservableObject {
                     // Photos and videos are already compressed; deflating them
                     // again costs minutes and saves almost nothing.
                     try archive.addEntry(with: photo.pathInZip, fileURL: temp, compressionMethod: .none)
+                    manifest.assetPaths[photo.assetID, default: []].append(photo.pathInZip)
                 } catch {
                     if Self.isOutOfSpace(error) { throw OutOfSpace() }
                     skipped.append("\(photo.pathInZip): \(error.localizedDescription)")
+                    manifest.incompleteAssets.insert(photo.assetID)
                 }
                 try? FileManager.default.removeItem(at: temp)
 
@@ -138,6 +199,7 @@ final class Exporter: ObservableObject {
                     try FolderSource.withReadableFile(url) { readable in
                         try archive.addEntry(with: pathInZip, fileURL: readable, compressionMethod: .deflate)
                     }
+                    manifest.files[pathInZip] = url
                 } catch {
                     if Self.isOutOfSpace(error) { throw OutOfSpace() }
                     skipped.append("\(pathInZip): \(error.localizedDescription)")
@@ -157,7 +219,7 @@ final class Exporter: ObservableObject {
         progress(items.count, items.count, "")
         succeeded = true
         let bytes = (try? zipURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 }.map(Int64.init) ?? 0
-        return (zipURL, bytes, skipped.count)
+        return Result(zip: zipURL, bytes: bytes, skipped: skipped.count, manifest: manifest)
     }
 
     private nonisolated static func freeBytes() -> Int64 {
@@ -165,7 +227,7 @@ final class Exporter: ObservableObject {
         return values?.volumeAvailableCapacityForImportantUsage ?? .max
     }
 
-    private nonisolated static func isOutOfSpace(_ error: Error) -> Bool {
+    nonisolated static func isOutOfSpace(_ error: Error) -> Bool {
         let ns = error as NSError
         return (ns.domain == NSCocoaErrorDomain && ns.code == NSFileWriteOutOfSpaceError)
             || (ns.domain == NSPOSIXErrorDomain && ns.code == Int(ENOSPC))
