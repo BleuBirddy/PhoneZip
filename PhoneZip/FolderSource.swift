@@ -41,11 +41,25 @@ enum FolderSource {
             guard let walker = FileManager.default.enumerator(
                 at: base,
                 includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+                options: [.skipsPackageDescendants]
             ) else { continue }
 
-            for case let file as URL in walker {
-                guard (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
+            for case let found as URL in walker {
+                let name = found.lastPathComponent
+                var file = found
+                if name.hasPrefix(".") {
+                    // iCloud Drive can keep a file that isn't downloaded as a
+                    // hidden ".Report.pdf.icloud" stand-in. That is a real file
+                    // to export (reading it downloads it); any other hidden
+                    // item is skipped.
+                    guard name.hasSuffix(".icloud"), name.count >= ".x.icloud".count else {
+                        walker.skipDescendants()
+                        continue
+                    }
+                    file = found.deletingLastPathComponent().appendingPathComponent(String(name.dropFirst().dropLast(".icloud".count)))
+                } else {
+                    guard (try? found.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
+                }
                 let full = file.standardizedFileURL.resolvingSymlinksInPath().path
                 if full.hasPrefix(ownFolder) { continue }
                 let relative = full.hasPrefix(base.path + "/") ? String(full.dropFirst(base.path.count + 1)) : file.lastPathComponent
@@ -53,6 +67,16 @@ enum FolderSource {
             }
         }
         return result
+    }
+
+    /// Copies the file to `temp`, downloading it first if it is only in
+    /// iCloud. The zip is filled from that local copy, so a download or read
+    /// error can't happen halfway through writing an entry (which would leave
+    /// the zip damaged). On the same storage the copy is a clone and takes no space.
+    static func copy(_ url: URL, to temp: URL) throws {
+        try withReadableFile(url) { readable in
+            try FileManager.default.copyItem(at: readable, to: temp)
+        }
     }
 
     /// Runs `body` with a readable local copy of the file. The coordinator is

@@ -36,8 +36,8 @@ struct ContentView: View {
                     progressSection
                 case .finished(let result):
                     finishedSection(result)
-                case .moved(let result, let copy):
-                    movedSection(result, copy)
+                case .moved(let summary):
+                    movedSection(summary)
                 case .cleaned(let report):
                     cleanedSection(report)
                 case .idle, .failed:
@@ -46,17 +46,18 @@ struct ContentView: View {
                     }
                     photosSection
                     foldersSection
+                    driveSection
                     Section {
                         Button {
                             exporter.start(photos: canSeePhotos && includePhotos,
                                            videos: canSeePhotos && includeVideos,
                                            folders: folders)
                         } label: {
-                            Label("Create Zip", systemImage: "archivebox").frame(maxWidth: .infinity)
+                            Label("Create Zip Only", systemImage: "archivebox").frame(maxWidth: .infinity)
                         }
                         .disabled(!hasSomethingToExport)
                     } footer: {
-                        Text("Needs free space about the size of everything you export. Keep PhoneZip open until it's done; the screen stays on.")
+                        Text("Keeps one zip on this iPhone, so it needs free space about the size of everything you export.")
                     }
                 }
                 if !exports.isEmpty && !exporter.isBusy {
@@ -83,8 +84,8 @@ struct ContentView: View {
             }
             .alert("Delete from this iPhone?", isPresented: $confirmingDelete) {
                 Button("Delete", role: .destructive) {
-                    if case .moved(let result, let copy) = exporter.state {
-                        exporter.deleteOriginals(result, copy: copy)
+                    if case .moved(let summary) = exporter.state {
+                        exporter.deleteOriginals(summary)
                     }
                 }
                 // Return on a hardware keyboard presses this one, never Delete.
@@ -146,16 +147,39 @@ struct ContentView: View {
         }
     }
 
+    private var driveSection: some View {
+        Section {
+            if let drive {
+                Button {
+                    exporter.exportToDrive(photos: canSeePhotos && includePhotos,
+                                           videos: canSeePhotos && includeVideos,
+                                           folders: folders, drive: drive)
+                } label: {
+                    Label("Copy to \(drive.name)", systemImage: "externaldrive.fill").frame(maxWidth: .infinity)
+                }
+                .disabled(!hasSomethingToExport)
+                Button("Choose Another Drive…") { openPicker(.drive) }
+            } else {
+                Button("Choose Drive…") { openPicker(.drive) }
+            }
+        } header: {
+            Text("USB Drive")
+        } footer: {
+            Text("Goes in parts of up to 500 items (fewer when the iPhone runs low on space): each part is zipped, unzipped onto the drive, checked and removed from the iPhone before the next one. Keep PhoneZip open and the drive plugged in until it's done; the screen stays on.")
+        }
+    }
+
     // MARK: Progress
 
     @ViewBuilder
     private var progressSection: some View {
         Section {
             switch exporter.state {
-            case .running(let done, let total, let current) where total > 0:
-                progress("Zipping", done, total, current)
-            case .moving(let done, let total, let current) where total > 0:
-                progress("Copying to drive and checking", done, total, current)
+            case .running(let part, let done, let total, let current) where total > 0:
+                progress(part > 0 ? "Part \(part): zipping" : "Zipping", done, total, current)
+            case .moving(let part, let done, let total, let current) where total > 0:
+                progress(part > 0 ? "Part \(part): copying to drive and checking" : "Copying to drive and checking",
+                         done, total, current)
             case .moving:
                 ProgressView("Opening the drive…")
             case .deleting:
@@ -171,6 +195,8 @@ struct ContentView: View {
                 Text("Keep PhoneZip open and the drive plugged in. Every file is read back from the drive to make sure it copied correctly.")
             } else if case .deleting = exporter.state {
                 Text("Only files that were checked on the drive are deleted.")
+            } else if case .running(let part, _, _, _) = exporter.state, part > 0 {
+                Text("Keep PhoneZip open and the drive plugged in. Parts already copied stay on the drive if you cancel.")
             } else {
                 Text("Keep PhoneZip open. If you switch apps, iOS may pause the export.")
             }
@@ -218,16 +244,27 @@ struct ContentView: View {
         }
     }
 
-    private func movedSection(_ result: Exporter.Result, _ copy: DriveCopy) -> some View {
-        let photos = DriveTransfer.deletableAssets(result.manifest, verified: copy.verified).count
-        let files = DriveTransfer.deletableFiles(result.manifest, verified: copy.verified).count
+    private func movedSection(_ summary: Exporter.DriveSummary) -> some View {
+        let photos = DriveTransfer.deletableAssets(summary.manifest, verified: summary.verified).count
+        let files = DriveTransfer.deletableFiles(summary.manifest, verified: summary.verified).count
         return Section {
-            Label("Copied and checked", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
-            LabeledContent("Folder on drive", value: copy.folder.lastPathComponent)
+            if let stopped = summary.stopped {
+                Label(stopped, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+            } else {
+                Label("Copied and checked", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
+            }
+            LabeledContent("Folder on drive", value: summary.folder.lastPathComponent)
+            if summary.parts > 1 {
+                LabeledContent("Parts", value: summary.parts.formatted())
+            }
             LabeledContent("Photos and videos", value: photos.formatted())
             LabeledContent("Files", value: files.formatted())
-            if !copy.failed.isEmpty {
-                Text("\(copy.failed.count) file(s) didn't copy correctly. Their originals stay on this iPhone, and so does the zip.")
+            if summary.skipped > 0 {
+                Text("\(summary.skipped) item(s) couldn't be read, so they weren't copied and stay on this iPhone. Their names are in \"Skipped files.txt\".")
+                    .foregroundStyle(.orange)
+            }
+            if !summary.failed.isEmpty {
+                Text("\(summary.failed.count) file(s) didn't copy correctly. Their originals stay on this iPhone.")
                     .foregroundStyle(.orange)
             }
             Button("Delete Originals from iPhone…", role: .destructive) { confirmingDelete = true }
@@ -236,17 +273,21 @@ struct ContentView: View {
         } header: {
             Text("On the Drive")
         } footer: {
-            Text(copy.zipRemoved
-                 ? "The zip on this iPhone was removed; the drive has everything unzipped."
-                 : "The zip is still on this iPhone.")
+            if summary.stopped != nil {
+                Text("Only what was copied and checked can be deleted. Run it again later for the rest; it starts a new folder on the drive.")
+            } else if summary.zipsKept > 0 {
+                Text("\(summary.zipsKept == 1 ? "A zip was" : "\(summary.zipsKept) zips were") kept on this iPhone because some of their files didn't copy correctly.")
+            } else {
+                Text("No zips were left on this iPhone; the drive has everything unzipped.")
+            }
         }
     }
 
     /// What deleting will do, spelled out before anything happens.
     private var deleteWarning: String {
-        guard case .moved(let result, let copy) = exporter.state else { return "" }
-        let photos = DriveTransfer.deletableAssets(result.manifest, verified: copy.verified).count
-        let files = DriveTransfer.deletableFiles(result.manifest, verified: copy.verified).count
+        guard case .moved(let summary) = exporter.state else { return "" }
+        let photos = DriveTransfer.deletableAssets(summary.manifest, verified: summary.verified).count
+        let files = DriveTransfer.deletableFiles(summary.manifest, verified: summary.verified).count
         return """
         \(photos.formatted()) photos and videos and \(files.formatted()) files are safely on the drive and will be deleted from this iPhone.
 

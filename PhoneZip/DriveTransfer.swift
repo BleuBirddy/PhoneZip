@@ -76,24 +76,9 @@ enum DriveTransfer {
 
     // MARK: Copy and check
 
-    /// Unzips straight from the phone onto the drive (no copy of the zip on
-    /// the drive, which would need double the space), then reads every file
-    /// back from the drive and compares it with the checksum stored in the zip.
-    nonisolated static func copy(
-        zip: URL, onto drive: PickedFolder,
-        progress: @escaping (Int, Int, String) -> Void
-    ) throws -> DriveCopy {
-        let archive = try Archive(url: zip, accessMode: .read)
-        let entries = archive.filter { $0.type == .file }
-
-        let needed = entries.reduce(Int64(0)) { $0 + Int64($1.uncompressedSize) }
-        if let free = try? drive.url.resourceValues(forKeys: [.volumeAvailableCapacityKey]).volumeAvailableCapacity,
-           Int64(free) < needed + 50_000_000 {
-            throw DriveFull(needed: needed, free: Int64(free))
-        }
-
-        // A folder named after the export, never reusing an existing one.
-        let name = zip.deletingPathExtension().lastPathComponent
+    /// A new folder on the drive named after the export, never reusing an
+    /// existing one. Every part of an export is unzipped into it.
+    nonisolated static func makeFolder(named name: String, on drive: PickedFolder) throws -> URL {
         var folder = drive.url.appendingPathComponent(name, isDirectory: true)
         var n = 2
         while FileManager.default.fileExists(atPath: folder.path) {
@@ -101,10 +86,41 @@ enum DriveTransfer {
             n += 1
         }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }
 
-        // A half-finished copy is removed so it can't be mistaken for a backup.
+    /// Removes a folder made for an export that never got a file into it.
+    nonisolated static func removeIfEmpty(_ folder: URL) {
+        if (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.isEmpty == true {
+            try? FileManager.default.removeItem(at: folder)
+        }
+    }
+
+    /// Unzips straight from the phone onto the drive (no copy of the zip on
+    /// the drive, which would need double the space), then reads every file
+    /// back from the drive and compares it with the checksum stored in the zip.
+    nonisolated static func copy(
+        zip: URL, into folder: URL,
+        progress: @escaping (Int, Int, String) -> Void
+    ) throws -> DriveCopy {
+        let archive = try Archive(url: zip, accessMode: .read)
+        let entries = archive.filter { $0.type == .file }
+
+        let needed = entries.reduce(Int64(0)) { $0 + Int64($1.uncompressedSize) }
+        if let free = try? folder.resourceValues(forKeys: [.volumeAvailableCapacityKey]).volumeAvailableCapacity,
+           Int64(free) < needed + 50_000_000 {
+            throw DriveFull(needed: needed, free: Int64(free))
+        }
+
+        // A half-finished copy is removed so it can't be mistaken for a
+        // backup. Only what this zip added goes; earlier parts stay.
+        var created: [URL] = []
         var completed = false
-        defer { if !completed { try? FileManager.default.removeItem(at: folder) } }
+        defer {
+            if !completed {
+                for url in created.reversed() { try? FileManager.default.removeItem(at: url) }
+            }
+        }
 
         var verified = Set<String>()
         var failed: [String] = []
@@ -116,7 +132,8 @@ enum DriveTransfer {
                 continue
             }
             do {
-                try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try makeParents(of: dest, in: folder, recording: &created)
+                created.append(dest)
                 let written = try archive.extract(entry, to: dest)
                 guard written == entry.checksum else { throw Mismatch() }
                 flushToDisk(dest)
@@ -133,6 +150,21 @@ enum DriveTransfer {
 
         let zipRemoved = failed.isEmpty && (try? FileManager.default.removeItem(at: zip)) != nil
         return DriveCopy(folder: folder, verified: verified, failed: failed, zipRemoved: zipRemoved)
+    }
+
+    /// Creates the folders above `dest`, noting each new one so a cancelled
+    /// part can take them away again.
+    private static func makeParents(of dest: URL, in folder: URL, recording created: inout [URL]) throws {
+        var missing: [URL] = []
+        var parent = dest.deletingLastPathComponent()
+        while parent.path.count > folder.standardizedFileURL.path.count, !FileManager.default.fileExists(atPath: parent.path) {
+            missing.append(parent)
+            parent = parent.deletingLastPathComponent()
+        }
+        for dir in missing.reversed() {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+            created.append(dir)
+        }
     }
 
     /// Where an entry goes, or nil if its path would escape the folder

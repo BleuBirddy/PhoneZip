@@ -17,6 +17,40 @@ struct ExportManifest {
     var incompleteAssets = Set<String>()
     /// Path in the zip → the document it was copied from.
     var files: [String: URL] = [:]
+
+    /// Combines the parts of an export that went out as several zips. A photo
+    /// split across two parts keeps all its paths, so it is still deleted
+    /// only when every one of them is on the drive.
+    mutating func merge(_ other: ExportManifest) {
+        for (id, paths) in other.assetPaths { assetPaths[id, default: []] += paths }
+        incompleteAssets.formUnion(other.incompleteAssets)
+        files.merge(other.files) { _, new in new }
+    }
+}
+
+extension ExportItem {
+    /// Photos count once however many files they have (Live Photo video, RAW,
+    /// original), so a batch of 500 means 500 things in Photos.
+    var unit: String {
+        switch self {
+        case .photoResource(let photo): "asset:" + photo.assetID
+        case .file(let url, _): "file:" + url.path
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .photoResource(let photo): (photo.pathInZip as NSString).lastPathComponent
+        case .file(let url, _): url.lastPathComponent
+        }
+    }
+
+    var pathInZip: String {
+        switch self {
+        case .photoResource(let photo): photo.pathInZip
+        case .file(_, let path): path
+        }
+    }
 }
 
 /// Hands out unique paths inside the zip. Two photos named IMG_0001.HEIC in the
