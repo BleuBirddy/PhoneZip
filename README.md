@@ -63,6 +63,24 @@ iPhone Export 2026-10-30 20.17.zip
   file never stops the rest: everything else is still copied, checked and
   can be deleted.
 
+## Save Space (lower quality)
+
+Photos and videos are already compressed, so zipping them (or using RAR or
+7-Zip) saves only 1–5%. To make an export much smaller, turn on **Save
+Space** under Size. It re-encodes instead of zipping harder:
+
+- **Photos** become HEIC at quality 0.6, full resolution, with date, location
+  and camera details kept. About 60% smaller than the simulator's JPEGs.
+- **Videos** (Live Photo videos included) become 1080p HEVC, about 7 Mbps.
+  A 4K 50 Mbps clip shrank by 87%. **Keep Original-Quality Videos** leaves
+  them exactly as they are.
+- A file that fails to re-encode, or wouldn't get smaller, goes in untouched.
+- Documents from folders are never changed.
+
+This is lossy, and starting such an export first shows a warning that spells
+out what is lost. Anything that was shrunk is never offered for deletion, so
+the full-quality original always stays on the phone.
+
 ## Using it
 
 1. Open PhoneZip and tap **Allow Photo Access**, then **Allow Full Access**.

@@ -65,12 +65,12 @@ final class Exporter: ObservableObject {
     }
 
     /// Builds one zip of everything and leaves it on the phone.
-    func start(photos: Bool, videos: Bool, folders: [PickedFolder]) {
+    func start(photos: Bool, videos: Bool, folders: [PickedFolder], saver: SpaceSaver?) {
         begin()
         task = Task.detached(priority: .userInitiated) { [weak self] in
             let outcome: State
             do {
-                let items = Self.items(photos: photos, videos: videos, folders: folders)
+                let items = Self.items(photos: photos, videos: videos, saver: saver, folders: folders)
                 let staging = try Self.makeStaging()
                 defer { try? FileManager.default.removeItem(at: staging) }
                 let zip = Self.newZipURL(Self.exportName())
@@ -91,7 +91,7 @@ final class Exporter: ObservableObject {
 
     /// Exports straight to the drive in parts, so the phone never needs room
     /// for more than one part at a time.
-    func exportToDrive(photos: Bool, videos: Bool, folders: [PickedFolder], drive: PickedFolder) {
+    func exportToDrive(photos: Bool, videos: Bool, folders: [PickedFolder], saver: SpaceSaver?, drive: PickedFolder) {
         begin()
         task = Task.detached(priority: .userInitiated) { [weak self] in
             var summary: DriveSummary?
@@ -99,7 +99,7 @@ final class Exporter: ObservableObject {
             var problem: String?
             var cancelled = false
             do {
-                let items = Self.items(photos: photos, videos: videos, folders: folders)
+                let items = Self.items(photos: photos, videos: videos, saver: saver, folders: folders)
                 let name = Self.exportName()
                 let folder = try DriveTransfer.makeFolder(named: name, on: drive)
                 summary = DriveSummary(folder: folder)
@@ -107,7 +107,7 @@ final class Exporter: ObservableObject {
                 defer { try? FileManager.default.removeItem(at: staging) }
 
                 var next = 0
-                var carried: URL?
+                var carried: Prepared?
                 while next < items.count {
                     let number = summary!.parts + 1
                     let part = try await Self.buildZip(
@@ -268,14 +268,24 @@ final class Exporter: ObservableObject {
         /// Index of the first item that isn't in this zip.
         let next: Int
         /// That item, already fetched, when the zip had no room left for it.
-        let carried: URL?
+        let carried: Prepared?
         let manifest: ExportManifest
         let skipped: [String]
     }
 
-    private nonisolated static func items(photos: Bool, videos: Bool, folders: [PickedFolder]) -> [ExportItem] {
+    /// An item fetched (and in Save Space mode re-encoded) to a local file,
+    /// ready to go into the zip.
+    struct Prepared {
+        let url: URL
+        let pathInZip: String
+        /// True when this is a re-encoded, lower-quality copy.
+        let shrunk: Bool
+    }
+
+    private nonisolated static func items(photos: Bool, videos: Bool, saver: SpaceSaver?,
+                                          folders: [PickedFolder]) -> [ExportItem] {
         var paths = ZipPathAllocator()
-        var items = PhotoSource.items(photos: photos, videos: videos, paths: &paths).map(ExportItem.photoResource)
+        var items = PhotoSource.items(photos: photos, videos: videos, saver: saver, paths: &paths).map(ExportItem.photoResource)
         items += FolderSource.items(in: folders, paths: &paths)
         return items
     }
@@ -315,7 +325,7 @@ final class Exporter: ObservableObject {
     /// before it goes in. ZIPFoundation leaves a zip damaged when an entry
     /// fails halfway, so an entry is only started once it can't fail.
     private nonisolated static func buildZip(
-        _ items: [ExportItem], from start: Int, carrying carried: URL?, to zipURL: URL, staging: URL,
+        _ items: [ExportItem], from start: Int, carrying carried: Prepared?, to zipURL: URL, staging: URL,
         batchSize: Int?, progress: @escaping (Int, String) -> Void
     ) async throws -> Part {
         let inParts = batchSize != nil
@@ -329,7 +339,7 @@ final class Exporter: ObservableObject {
         var units = Set<String>()
         var hasEntries = false
         var carried = carried
-        var carriedOut: URL?
+        var carriedOut: Prepared?
         var index = start
 
         func skip(_ item: ExportItem, _ reason: String) {
@@ -344,10 +354,11 @@ final class Exporter: ObservableObject {
             units.insert(item.unit)
             progress(index, item.displayName)
 
-            // 1. A local copy, downloaded from iCloud if need be.
-            let temp: URL
+            // 1. A local copy, downloaded from iCloud if need be, and
+            // re-encoded in Save Space mode.
+            let prepared: Prepared
             if let ready = carried {
-                temp = ready
+                prepared = ready
                 carried = nil
             } else {
                 if freeBytes() < minimumFreeBytes {
@@ -355,11 +366,11 @@ final class Exporter: ObservableObject {
                     if hasEntries { break }
                     throw PhoneFull()
                 }
-                temp = staging.appendingPathComponent(UUID().uuidString)
+                let fetched = staging.appendingPathComponent(UUID().uuidString)
                 do {
-                    try await fetch(item, to: temp)
+                    try await fetch(item, to: fetched)
                 } catch {
-                    try? FileManager.default.removeItem(at: temp)
+                    try? FileManager.default.removeItem(at: fetched)
                     if isOutOfSpace(error) {
                         if !inParts { throw OutOfSpace() }
                         // Try it again in the next part, once this zip is off the phone.
@@ -371,7 +382,9 @@ final class Exporter: ObservableObject {
                     index += 1
                     continue
                 }
+                prepared = try await shrinkIfAsked(item, fetched, staging: staging)
             }
+            let temp = prepared.url
 
             // 2. Room for it in the zip? Its exact size is known now.
             if freeBytes() < fileSize(temp) + minimumFreeBytes {
@@ -380,7 +393,7 @@ final class Exporter: ObservableObject {
                     throw OutOfSpace()
                 }
                 if hasEntries {
-                    carriedOut = temp
+                    carriedOut = prepared
                     break
                 }
                 try? FileManager.default.removeItem(at: temp)
@@ -394,8 +407,9 @@ final class Exporter: ObservableObject {
             do {
                 switch item {
                 case .photoResource(let photo):
-                    try archive.addEntry(with: photo.pathInZip, fileURL: temp, compressionMethod: .none)
-                    manifest.assetPaths[photo.assetID, default: []].append(photo.pathInZip)
+                    try archive.addEntry(with: prepared.pathInZip, fileURL: temp, compressionMethod: .none)
+                    manifest.assetPaths[photo.assetID, default: []].append(prepared.pathInZip)
+                    if prepared.shrunk { manifest.shrunkAssets.insert(photo.assetID) }
                 case .file(let url, let pathInZip):
                     try archive.addEntry(with: pathInZip, fileURL: temp, compressionMethod: .deflate)
                     manifest.files[pathInZip] = url
@@ -422,6 +436,35 @@ final class Exporter: ObservableObject {
         progress(index, "")
         succeeded = true
         return Part(zip: zipURL, next: index, carried: carriedOut, manifest: manifest, skipped: skipped)
+    }
+
+    /// In Save Space mode, swaps the fetched file for a re-encoded one. If
+    /// re-encoding fails or doesn't make it smaller, the untouched original
+    /// goes in instead (under its own name), so nothing is ever lost.
+    private nonisolated static func shrinkIfAsked(_ item: ExportItem, _ temp: URL, staging: URL) async throws -> Prepared {
+        guard case .photoResource(let photo) = item, let kind = photo.shrink else {
+            return Prepared(url: temp, pathInZip: item.pathInZip, shrunk: false)
+        }
+        let ext = (photo.pathInZip as NSString).pathExtension
+        let shrunk = staging.appendingPathComponent(UUID().uuidString).appendingPathExtension(ext)
+        do {
+            switch kind {
+            case .photo: try Shrinker.shrinkPhoto(temp, to: shrunk)
+            case .video: try await Shrinker.shrinkVideo(temp, to: shrunk, fileType: Shrinker.videoFileType(forExtension: ext))
+            }
+            if fileSize(shrunk) > 0 && fileSize(shrunk) < fileSize(temp) {
+                try? FileManager.default.removeItem(at: temp)
+                return Prepared(url: shrunk, pathInZip: photo.pathInZip, shrunk: true)
+            }
+        } catch is CancellationError {
+            try? FileManager.default.removeItem(at: shrunk)
+            try? FileManager.default.removeItem(at: temp)
+            throw CancellationError()
+        } catch {
+            // Fall through to the original.
+        }
+        try? FileManager.default.removeItem(at: shrunk)
+        return Prepared(url: temp, pathInZip: photo.fallbackPath ?? photo.pathInZip, shrunk: false)
     }
 
     private nonisolated static func fetch(_ item: ExportItem, to temp: URL) async throws {

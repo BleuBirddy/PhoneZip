@@ -23,7 +23,23 @@ struct ContentView: View {
     @State private var pickerError: String?
     @State private var confirmingDelete = false
 
+    /// Save Space: re-encode photos (and videos, unless kept) to shrink the
+    /// export. Lossy, so starting one always asks first.
+    @State private var saveSpace = false
+    @State private var keepOriginalVideos = false
+    private enum ExportJob { case zipOnly, drive(PickedFolder) }
+    @State private var pendingExport: ExportJob?
+
     private var canSeePhotos: Bool { photoStatus == .authorized || photoStatus == .limited }
+    private var exportsPhotoLibrary: Bool {
+        canSeePhotos && (includePhotos && counts.photos > 0 || includeVideos && counts.videos > 0)
+    }
+    /// Shrinking applies only when something would actually be re-encoded.
+    private var saver: SpaceSaver? {
+        guard saveSpace, exportsPhotoLibrary else { return nil }
+        if keepOriginalVideos && !includePhotos { return nil }
+        return SpaceSaver(keepOriginalVideos: keepOriginalVideos || !includeVideos)
+    }
     private var hasSomethingToExport: Bool {
         (canSeePhotos && (includePhotos && counts.photos > 0 || includeVideos && counts.videos > 0)) || !folders.isEmpty
     }
@@ -46,12 +62,11 @@ struct ContentView: View {
                     }
                     photosSection
                     foldersSection
+                    saveSpaceSection
                     driveSection
                     Section {
                         Button {
-                            exporter.start(photos: canSeePhotos && includePhotos,
-                                           videos: canSeePhotos && includeVideos,
-                                           folders: folders)
+                            requestExport(.zipOnly)
                         } label: {
                             Label("Create Zip Only", systemImage: "archivebox").frame(maxWidth: .infinity)
                         }
@@ -81,6 +96,14 @@ struct ContentView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(exporter.notice ?? "")
+            }
+            .alert("Export at Lower Quality?", isPresented: isPresent($pendingExport), presenting: pendingExport) { job in
+                Button("Yes, Lower the Quality", role: .destructive) { run(job) }
+                // Return on a hardware keyboard presses this one, never Yes.
+                Button("Cancel", role: .cancel) {}
+                    .keyboardShortcut(.defaultAction)
+            } message: { _ in
+                Text(lowQualityWarning)
             }
             .alert("Delete from this iPhone?", isPresented: $confirmingDelete) {
                 Button("Delete", role: .destructive) {
@@ -147,13 +170,32 @@ struct ContentView: View {
         }
     }
 
+    private var saveSpaceSection: some View {
+        Section {
+            Toggle("Save Space (Lower Quality)", isOn: $saveSpace.animation())
+            if saveSpace {
+                Toggle("Keep Original-Quality Videos", isOn: $keepOriginalVideos)
+            }
+        } header: {
+            Text("Size")
+        } footer: {
+            if !saveSpace {
+                Text("Off: every photo and video goes out exactly as it is on this iPhone, at full quality.")
+            } else if keepOriginalVideos {
+                Text("Photos are re-encoded as smaller HEICs (about half the size, some fine detail lost). Videos stay at full quality, so the export shrinks much less. Shrunk photos are never deleted from this iPhone.")
+                    .foregroundStyle(.orange)
+            } else {
+                Text("Photos are re-encoded as smaller HEICs and videos as 1080p HEVC. A 3.4 GB export with lots of 4K video typically ends up under 1 GB, but quality is lost for good. Shrunk photos and videos are never deleted from this iPhone.")
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
     private var driveSection: some View {
         Section {
             if let drive {
                 Button {
-                    exporter.exportToDrive(photos: canSeePhotos && includePhotos,
-                                           videos: canSeePhotos && includeVideos,
-                                           folders: folders, drive: drive)
+                    requestExport(.drive(drive))
                 } label: {
                     Label("Copy to \(drive.name)", systemImage: "externaldrive.fill").frame(maxWidth: .infinity)
                 }
@@ -176,7 +218,9 @@ struct ContentView: View {
         Section {
             switch exporter.state {
             case .running(let part, let done, let total, let current) where total > 0:
-                progress(part > 0 ? "Part \(part): zipping" : "Zipping", done, total, current)
+                let verb = saver != nil ? "shrinking and zipping" : "zipping"
+                progress(part > 0 ? "Part \(part): \(verb)" : verb.prefix(1).uppercased() + verb.dropFirst(),
+                         done, total, current)
             case .moving(let part, let done, let total, let current) where total > 0:
                 progress(part > 0 ? "Part \(part): copying to drive and checking" : "Copying to drive and checking",
                          done, total, current)
@@ -267,6 +311,10 @@ struct ContentView: View {
                 Text("\(summary.failed.count) file(s) didn't copy correctly. Their originals stay on this iPhone.")
                     .foregroundStyle(.orange)
             }
+            if !summary.manifest.shrunkAssets.isEmpty {
+                Text("\(summary.manifest.shrunkAssets.count.formatted()) photos and videos went to the drive at lower quality (Save Space), so their full-quality originals stay on this iPhone and can't be deleted here.")
+                    .foregroundStyle(.orange)
+            }
             Button("Delete Originals from iPhone…", role: .destructive) { confirmingDelete = true }
                 .disabled(photos + files == 0)
             Button("Keep Them") { exporter.reset() }
@@ -281,6 +329,24 @@ struct ContentView: View {
                 Text("No zips were left on this iPhone; the drive has everything unzipped.")
             }
         }
+    }
+
+    /// What Save Space does, spelled out before anything is re-encoded.
+    private var lowQualityWarning: String {
+        let shrinksVideos = saver.map { !$0.keepOriginalVideos } ?? false
+        var lines = ["If you tap Yes, this export will NOT be a full-quality backup:"]
+        if includePhotos {
+            lines.append("• Every photo is re-encoded as a smaller HEIC. It looks about the same on a phone, but fine detail is thrown away, and RAW photos become ordinary HEICs that can no longer be edited as RAW.")
+        }
+        if shrinksVideos {
+            lines.append("• Every video, including Live Photo videos, is re-encoded to 1080p HEVC. 4K, 60 fps and high-bitrate footage permanently loses resolution and sharpness.")
+        } else {
+            lines.append("• Videos are copied exactly as they are, at full quality.")
+        }
+        lines.append("• The lost quality can never be recovered from this export. The only full-quality copies are the originals on this iPhone (and in iCloud Photos, if it's on).")
+        lines.append("• Because of that, PhoneZip will never offer to delete anything it shrank. If you delete those photos or videos yourself later, the full-quality versions are gone forever.")
+        lines.append("• Re-encoding is much slower than a normal export and uses a lot of battery. Documents from folders are never changed.")
+        return lines.joined(separator: "\n\n")
     }
 
     /// What deleting will do, spelled out before anything happens.
@@ -343,6 +409,27 @@ struct ContentView: View {
 
     // MARK: Helpers
 
+    /// Starts right away at full quality; in Save Space mode, only after the
+    /// lower-quality warning is accepted.
+    private func requestExport(_ job: ExportJob) {
+        if saver != nil {
+            pendingExport = job
+        } else {
+            run(job)
+        }
+    }
+
+    private func run(_ job: ExportJob) {
+        let photos = canSeePhotos && includePhotos
+        let videos = canSeePhotos && includeVideos
+        switch job {
+        case .zipOnly:
+            exporter.start(photos: photos, videos: videos, folders: folders, saver: saver)
+        case .drive(let drive):
+            exporter.exportToDrive(photos: photos, videos: videos, folders: folders, saver: saver, drive: drive)
+        }
+    }
+
     private func openPicker(_ job: PickerJob) {
         pickerJob = job
         showingPicker = true
@@ -380,7 +467,7 @@ struct ContentView: View {
         Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
     }
 
-    private func isPresent(_ text: Binding<String?>) -> Binding<Bool> {
-        Binding(get: { text.wrappedValue != nil }, set: { if !$0 { text.wrappedValue = nil } })
+    private func isPresent<T>(_ value: Binding<T?>) -> Binding<Bool> {
+        Binding(get: { value.wrappedValue != nil }, set: { if !$0 { value.wrappedValue = nil } })
     }
 }

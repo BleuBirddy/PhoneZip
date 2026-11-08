@@ -201,10 +201,12 @@ enum DriveTransfer {
 
     // MARK: Deleting originals
 
-    /// Photos whose every exported file is verified on the drive.
+    /// Photos whose every exported file is verified on the drive, at full
+    /// quality. Anything Save Space re-encoded is never deleted.
     static func deletableAssets(_ manifest: ExportManifest, verified: Set<String>) -> [String] {
         manifest.assetPaths.compactMap { id, paths in
-            !manifest.incompleteAssets.contains(id) && paths.allSatisfy(verified.contains) ? id : nil
+            !manifest.incompleteAssets.contains(id) && !manifest.shrunkAssets.contains(id)
+                && paths.allSatisfy(verified.contains) ? id : nil
         }
     }
 

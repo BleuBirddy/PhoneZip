@@ -15,6 +15,9 @@ struct ExportManifest {
     var assetPaths: [String: [String]] = [:]
     /// Photos with at least one file that failed to export. Never deleted.
     var incompleteAssets = Set<String>()
+    /// Photos with at least one file re-encoded by Save Space. The drive only
+    /// has a lower-quality copy, so these are never deleted from the phone.
+    var shrunkAssets = Set<String>()
     /// Path in the zip → the document it was copied from.
     var files: [String: URL] = [:]
 
@@ -24,6 +27,7 @@ struct ExportManifest {
     mutating func merge(_ other: ExportManifest) {
         for (id, paths) in other.assetPaths { assetPaths[id, default: []] += paths }
         incompleteAssets.formUnion(other.incompleteAssets)
+        shrunkAssets.formUnion(other.shrunkAssets)
         files.merge(other.files) { _, new in new }
     }
 }

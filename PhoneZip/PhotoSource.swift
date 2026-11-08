@@ -1,5 +1,6 @@
 import Foundation
 import Photos
+import UniformTypeIdentifiers
 
 /// Reads the photo library. Apps can see the whole library once the user taps
 /// "Allow Full Access"; with "Limited Access" PhotoKit only returns the photos
@@ -13,6 +14,11 @@ enum PhotoSource {
         /// Which photo this file belongs to, so the photo is only deleted from
         /// the phone once every one of its files is safely on the drive.
         let assetID: String
+        /// Set in Save Space mode: re-encode this file before zipping it.
+        var shrink: Shrinker.Kind? = nil
+        /// Where the untouched file goes if re-encoding fails. A shrunk photo
+        /// is renamed to .HEIC, so its original name is reserved too.
+        var fallbackPath: String? = nil
     }
 
     static func requestAccess() async -> PHAuthorizationStatus {
@@ -31,7 +37,7 @@ enum PhotoSource {
     }
 
     /// Lists every file to export, oldest first, filed as Photos/2024/2024-05/.
-    static func items(photos: Bool, videos: Bool, paths: inout ZipPathAllocator) -> [Item] {
+    static func items(photos: Bool, videos: Bool, saver: SpaceSaver?, paths: inout ZipPathAllocator) -> [Item] {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
         options.includeHiddenAssets = true
@@ -53,11 +59,32 @@ enum PhotoSource {
             let asset = assets.object(at: index)
             let folder = asset.creationDate.map { "Photos/" + folderFormat.string(from: $0) } ?? "Photos/Undated"
             for (resource, name) in exportResources(for: asset) {
-                result.append(Item(resource: resource, pathInZip: paths.unique("\(folder)/\(name)"),
-                                   assetID: asset.localIdentifier))
+                let original = "\(folder)/\(name)"
+                switch saver.flatMap({ shrinkKind(resource, $0) }) {
+                case .photo:
+                    let heic = (original as NSString).deletingPathExtension + ".HEIC"
+                    result.append(Item(resource: resource, pathInZip: paths.unique(heic), assetID: asset.localIdentifier,
+                                       shrink: .photo, fallbackPath: paths.unique(original)))
+                case .video:
+                    result.append(Item(resource: resource, pathInZip: paths.unique(original),
+                                       assetID: asset.localIdentifier, shrink: .video))
+                case nil:
+                    result.append(Item(resource: resource, pathInZip: paths.unique(original), assetID: asset.localIdentifier))
+                }
             }
         }
         return result
+    }
+
+    /// Which files Save Space re-encodes: every photo (RAW included), and
+    /// every video (Live Photo videos too) unless videos are kept as they are.
+    private static func shrinkKind(_ resource: PHAssetResource, _ saver: SpaceSaver) -> Shrinker.Kind? {
+        guard let type = UTType(resource.uniformTypeIdentifier) else { return nil }
+        if type.conforms(to: .image) { return .photo }
+        if type.conforms(to: .movie) || type.conforms(to: .audiovisualContent) {
+            return saver.keepOriginalVideos ? nil : .video
+        }
+        return nil
     }
 
     /// Picks which stored files of an asset to export. Each asset can hold
