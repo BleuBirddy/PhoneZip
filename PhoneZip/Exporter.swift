@@ -7,7 +7,7 @@ import ZIPFoundation
 /// 2. unzip it onto an external drive and check every file,
 /// 3. after the user confirms, delete the checked originals from the phone.
 ///
-/// Copying to a drive goes in parts: a zip of up to 500 items (fewer if the
+/// Copying to a drive goes in parts: a zip of up to 500 items or 4 GB (fewer if the
 /// phone runs low on space) is built, unzipped onto the drive, checked and
 /// removed, then the next part starts. A library bigger than the phone's free
 /// space goes out that way, and all parts land in one folder on the drive.
@@ -21,7 +21,11 @@ final class Exporter: ObservableObject {
         let zip: URL
         let bytes: Int64
         let skipped: Int
+        /// Photo files left out because they're only in iCloud.
+        let inICloud: Int
         let manifest: ExportManifest
+        /// Paths whose file was read back out of the finished zip and matched.
+        let checkedInZip: Set<String>
     }
 
     /// What the copy to the drive left there, over every part of the export.
@@ -32,10 +36,20 @@ final class Exporter: ObservableObject {
         var verified = Set<String>()
         var failed: [String] = []
         var skipped = 0
+        var inICloud = 0
         /// Zips left on the phone because something in them didn't copy correctly.
         var zipsKept = 0
         /// Why it ended before everything was copied, if it did.
         var stopped: String?
+        /// The picked drive, kept so its access stays open until the user
+        /// has decided about deleting (the copies are checked again then).
+        var driveAccess: PickedFolder?
+        /// Files whose drive copy failed but that sit, checked, in a zip that
+        /// stayed on this iPhone: path → that zip. They count as copied.
+        var keptInZips: [String: URL] = [:]
+
+        /// Everything with a checked copy, on the drive or in a kept zip.
+        var safe: Set<String> { verified.union(keptInZips.keys) }
     }
 
     enum State {
@@ -43,23 +57,31 @@ final class Exporter: ObservableObject {
         case preparing
         /// `part` is 0 for a single zip that stays on the phone.
         case running(part: Int, done: Int, total: Int, current: String)
+        /// Reading the finished zip back to check every file in it.
+        case checking(part: Int, done: Int, total: Int, current: String)
         case finished(Result)
         case moving(part: Int, done: Int, total: Int, current: String)
         case moved(DriveSummary)
         case deleting
         case cleaned(DeleteReport)
         case failed(String)
+        /// Everything on the phone is done; some photos are only in iCloud.
+        /// Waits for the user to say whether to download them.
+        case askingICloud(photos: Int)
     }
 
     @Published private(set) var state: State = .idle
     /// A problem to show without leaving the current step (e.g. the drive
     /// filled up, so the user can try another drive).
     @Published var notice: String?
+    /// True while photos the user agreed to download come in from iCloud.
+    @Published private(set) var fromICloud = false
     private var task: Task<Void, Never>?
+    private var iCloudAnswer: CheckedContinuation<Bool, Never>?
 
     var isBusy: Bool {
         switch state {
-        case .preparing, .running, .moving, .deleting: true
+        case .preparing, .running, .checking, .moving, .deleting, .askingICloud: true
         default: false
         }
     }
@@ -69,20 +91,58 @@ final class Exporter: ObservableObject {
         begin()
         task = Task.detached(priority: .userInitiated) { [weak self] in
             let outcome: State
+            var zip: URL?
             do {
                 let items = Self.items(photos: photos, videos: videos, saver: saver, folders: folders)
                 let staging = try Self.makeStaging()
                 defer { try? FileManager.default.removeItem(at: staging) }
-                let zip = Self.newZipURL(Self.exportName())
-                let part = try await Self.buildZip(items, from: 0, carrying: nil, to: zip, staging: staging,
-                                                   batchSize: nil) { done, current in
-                    Task { @MainActor in self?.state = .running(part: 0, done: done, total: items.count, current: current) }
+                zip = Self.newZipURL(Self.exportName(for: items))
+                var part = try await Self.buildZip(items, from: 0, carrying: nil, to: zip!, appending: false,
+                                                   staging: staging, batchSize: nil) { done, current in
+                    Task { @MainActor in self?.show(.running(part: 0, done: done, total: items.count, current: current)) }
                 }
-                outcome = .finished(Result(zip: zip, bytes: Self.fileSize(zip),
-                                           skipped: part.skipped.count, manifest: part.manifest))
+                var manifest = part.manifest
+                manifest.fileRoots = folders.map(\.url)
+                var skipped = part.skipped
+                var leftInICloud: [ExportItem] = []
+
+                // Photos only in iCloud were held back. Download them into
+                // the same zip only if the user says so.
+                if !part.held.isEmpty {
+                    let held = Self.allowingICloud(part.held)
+                    if await self?.askAboutICloud(held) == true {
+                        part = try await Self.buildZip(held, from: 0, carrying: nil, to: zip!, appending: true,
+                                                       staging: staging, batchSize: nil) { done, current in
+                            Task { @MainActor in self?.show(.running(part: 0, done: done, total: held.count, current: current)) }
+                        }
+                        manifest.merge(part.manifest)
+                        skipped += part.skipped
+                        // Asked once already; a file that still won't download is just skipped.
+                        for item in part.held { Self.leaveOut(item, in: &manifest) }
+                        skipped += part.held.map { "\($0.pathInZip): couldn't be downloaded from iCloud" }
+                    } else {
+                        try Task.checkCancellation()
+                        leftInICloud = held
+                        for item in held { Self.leaveOut(item, in: &manifest) }
+                    }
+                }
+
+                // The list of what didn't make it goes inside the zip.
+                let inICloud = leftInICloud.map(\.pathInZip)
+                if !skipped.isEmpty || !inICloud.isEmpty {
+                    try Self.appendReport(Self.skippedReport(skipped, inICloud: inICloud), to: zip!)
+                }
+                let checked = try DriveTransfer.verifyZip(zip!) { done, total, current in
+                    Task { @MainActor in self?.show(.checking(part: 0, done: done, total: total, current: current)) }
+                }
+                outcome = .finished(Result(zip: zip!, bytes: Self.fileSize(zip!),
+                                           skipped: skipped.count, inICloud: inICloud.count,
+                                           manifest: manifest, checkedInZip: checked))
             } catch is CancellationError {
+                if let zip { try? FileManager.default.removeItem(at: zip) }
                 outcome = .idle
             } catch {
+                if let zip { try? FileManager.default.removeItem(at: zip) }
                 outcome = .failed(error.localizedDescription)
             }
             await self?.end(outcome)
@@ -96,39 +156,85 @@ final class Exporter: ObservableObject {
         task = Task.detached(priority: .userInitiated) { [weak self] in
             var summary: DriveSummary?
             var skipped: [String] = []
+            var inICloud: [String] = []
+            // Held-back photo files not yet settled. If the export stops
+            // early, their photos must never be offered for deletion.
+            var pending: [ExportItem] = []
             var problem: String?
             var cancelled = false
             do {
                 let items = Self.items(photos: photos, videos: videos, saver: saver, folders: folders)
-                let name = Self.exportName()
+                let name = Self.exportName(for: items)
                 let folder = try DriveTransfer.makeFolder(named: name, on: drive)
-                summary = DriveSummary(folder: folder)
+                summary = DriveSummary(folder: folder, driveAccess: drive)
+                summary!.manifest.fileRoots = folders.map(\.url)
                 let staging = try Self.makeStaging()
                 defer { try? FileManager.default.removeItem(at: staging) }
 
-                var next = 0
-                var carried: Prepared?
-                while next < items.count {
-                    let number = summary!.parts + 1
-                    let part = try await Self.buildZip(
-                        items, from: next, carrying: carried, to: Self.newZipURL("\(name) part \(number)"),
-                        staging: staging, batchSize: Self.batchSize
-                    ) { done, current in
-                        Task { @MainActor in self?.state = .running(part: number, done: done, total: items.count, current: current) }
-                    }
-                    skipped += part.skipped
-                    summary!.skipped += part.skipped.count
-                    summary!.manifest.merge(part.manifest)
+                /// Zips `list` in parts, copying each part to the drive.
+                /// Returns the photo files held back because they're only in iCloud.
+                func copyInParts(_ list: [ExportItem]) async throws -> [ExportItem] {
+                    var held: [ExportItem] = []
+                    var next = 0
+                    var carried: Prepared?
+                    while next < list.count {
+                        let number = summary!.parts + 1
+                        let part = try await Self.buildZip(
+                            list, from: next, carrying: carried, to: Self.newZipURL("\(name) part \(number)"),
+                            appending: false, staging: staging, batchSize: Self.batchSize
+                        ) { done, current in
+                            Task { @MainActor in self?.show(.running(part: number, done: done, total: list.count, current: current)) }
+                        }
+                        skipped += part.skipped
+                        summary!.skipped += part.skipped.count
+                        held += part.held
+                        summary!.manifest.merge(part.manifest)
 
-                    let copy = try DriveTransfer.copy(zip: part.zip, into: folder) { done, total, current in
-                        Task { @MainActor in self?.state = .moving(part: number, done: done, total: total, current: current) }
+                        // Check the zip itself first: if the drive won't take
+                        // the files, a checked zip left on the phone still counts.
+                        let inZip = try DriveTransfer.verifyZip(part.zip) { done, total, current in
+                            Task { @MainActor in self?.show(.checking(part: number, done: done, total: total, current: current)) }
+                        }
+                        func keepZip(except copied: Set<String>) {
+                            for path in inZip where !copied.contains(path) { summary!.keptInZips[path] = part.zip }
+                        }
+                        let copy: DriveCopy
+                        do {
+                            copy = try DriveTransfer.copy(zip: part.zip, into: folder) { done, total, current in
+                                Task { @MainActor in self?.show(.moving(part: number, done: done, total: total, current: current)) }
+                            }
+                        } catch {
+                            // The part's zip stays on the phone; its checked files count.
+                            if FileManager.default.fileExists(atPath: part.zip.path) { keepZip(except: []) }
+                            summary!.parts = number
+                            throw error
+                        }
+                        if !copy.zipRemoved { keepZip(except: copy.verified) }
+                        summary!.parts = number
+                        summary!.verified.formUnion(copy.verified)
+                        summary!.failed += copy.failed
+                        if !copy.zipRemoved { summary!.zipsKept += 1 }
+                        next = part.next
+                        carried = part.carried
                     }
-                    summary!.parts = number
-                    summary!.verified.formUnion(copy.verified)
-                    summary!.failed += copy.failed
-                    if !copy.zipRemoved { summary!.zipsKept += 1 }
-                    next = part.next
-                    carried = part.carried
+                    return held
+                }
+
+                let held = Self.allowingICloud(try await copyInParts(items))
+                pending = held
+                if !held.isEmpty {
+                    if await self?.askAboutICloud(held) == true {
+                        let stillHeld = try await copyInParts(held)
+                        pending = stillHeld
+                        for item in stillHeld { Self.leaveOut(item, in: &summary!.manifest) }
+                        skipped += stillHeld.map { "\($0.pathInZip): couldn't be downloaded from iCloud" }
+                        summary!.skipped += stillHeld.count
+                    } else {
+                        try Task.checkCancellation()
+                        for item in held { Self.leaveOut(item, in: &summary!.manifest) }
+                        inICloud = held.map(\.pathInZip)
+                        summary!.inICloud = held.count
+                    }
                 }
             } catch is CancellationError {
                 cancelled = true
@@ -140,12 +246,17 @@ final class Exporter: ObservableObject {
             let outcome: State
             if var summary, summary.parts > 0 {
                 summary.stopped = problem
+                for item in pending { Self.leaveOut(item, in: &summary.manifest) }
                 // The list of what didn't make it goes next to the photos, so a
                 // missing file isn't discovered months later.
                 let missing = skipped + summary.failed
-                if !missing.isEmpty {
-                    let report = "Not included in this export:\n\n" + missing.joined(separator: "\n") + "\n"
-                    try? Data(report.utf8).write(to: summary.folder.appendingPathComponent("Skipped files.txt"))
+                if !missing.isEmpty || !inICloud.isEmpty {
+                    let report = Data(Self.skippedReport(missing, inICloud: inICloud).utf8)
+                    // A copy stays on the phone (in Files, next to the zips),
+                    // so the list survives a drive that stopped taking writes.
+                    try? report.write(to: Self.documents.appendingPathComponent(
+                        "\(summary.folder.lastPathComponent) - Skipped files.txt"))
+                    try? report.write(to: summary.folder.appendingPathComponent("Skipped files.txt"))
                 }
                 outcome = .moved(summary)
             } else {
@@ -171,9 +282,14 @@ final class Exporter: ObservableObject {
                 let copy = try DriveTransfer.copy(zip: result.zip, into: folder!) { done, total, current in
                     Task { @MainActor in self?.state = .moving(part: 0, done: done, total: total, current: current) }
                 }
-                outcome = .moved(DriveSummary(folder: folder!, parts: 1, manifest: result.manifest,
-                                              verified: copy.verified, failed: copy.failed,
-                                              skipped: result.skipped, zipsKept: copy.zipRemoved ? 0 : 1))
+                var summary = DriveSummary(folder: folder!, parts: 1, manifest: result.manifest,
+                                           verified: copy.verified, failed: copy.failed,
+                                           skipped: result.skipped, inICloud: result.inICloud, zipsKept: copy.zipRemoved ? 0 : 1,
+                                           driveAccess: drive)
+                if !copy.zipRemoved {
+                    for path in result.checkedInZip where !copy.verified.contains(path) { summary.keptInZips[path] = result.zip }
+                }
+                outcome = .moved(summary)
             } catch {
                 // Back to the finished step: the zip is still on the phone,
                 // so another drive can be tried.
@@ -189,13 +305,52 @@ final class Exporter: ObservableObject {
     func deleteOriginals(_ summary: DriveSummary) {
         state = .deleting
         task = Task { [weak self] in
-            let report = await DriveTransfer.deleteOriginals(summary.manifest, verified: summary.verified)
+            let report = await DriveTransfer.deleteOriginals(summary.manifest, verified: summary.safe,
+                                                             on: summary.folder, inZips: summary.keptInZips)
+            self?.state = .cleaned(report)
+        }
+    }
+
+    /// Deletes what the finished zip on this iPhone was checked to hold.
+    func deleteOriginals(_ result: Result) {
+        state = .deleting
+        task = Task { [weak self] in
+            let inZip = Dictionary(uniqueKeysWithValues: result.checkedInZip.map { ($0, result.zip) })
+            let report = await DriveTransfer.deleteOriginals(result.manifest, verified: result.checkedInZip,
+                                                             on: nil, inZips: inZip)
             self?.state = .cleaned(report)
         }
     }
 
     func cancel() {
         task?.cancel()
+        answerICloud(false)
+    }
+
+    /// The user's answer to "Download N photos from iCloud?".
+    func answerICloud(_ download: Bool) {
+        guard let answer = iCloudAnswer else { return }
+        iCloudAnswer = nil
+        if download { fromICloud = true }
+        state = .preparing
+        answer.resume(returning: download)
+    }
+
+    /// Pauses the export until the user answers. Nothing is downloaded
+    /// from iCloud without a yes.
+    private func askAboutICloud(_ held: [ExportItem]) async -> Bool {
+        if Task.isCancelled { return false }
+        let photos = Set(held.map(\.unit)).count
+        return await withCheckedContinuation { continuation in
+            iCloudAnswer = continuation
+            state = .askingICloud(photos: photos)
+        }
+    }
+
+    /// Progress updates arrive a moment late; one must never cover the question.
+    private func show(_ progress: State) {
+        if case .askingICloud = state { return }
+        state = progress
     }
 
     func reset() {
@@ -204,6 +359,7 @@ final class Exporter: ObservableObject {
 
     private func begin() {
         state = .preparing
+        fromICloud = false
         // iOS suspends apps soon after they leave the screen, and auto-lock
         // counts. Keeping the screen awake is the simplest way to let a big
         // export finish; the UI tells the user to keep the app open.
@@ -212,6 +368,7 @@ final class Exporter: ObservableObject {
 
     private func end(_ outcome: State, notice: String? = nil) {
         UIApplication.shared.isIdleTimerDisabled = false
+        fromICloud = false
         state = outcome
         self.notice = notice
     }
@@ -262,6 +419,20 @@ final class Exporter: ObservableObject {
         #endif
     }
 
+    /// Bytes per part when copying to a drive. A count alone let 132 big
+    /// videos make one 118 GB part: nothing reached the drive for over an
+    /// hour, and one problem cost the whole lot. A part closes once it holds
+    /// this much (a single bigger file still goes in a part of its own).
+    private nonisolated static var partBytes: Int64 {
+        #if DEBUG
+        // For testing parts with small videos: -PZPartBytes <n> on launch.
+        let debug = Int64(UserDefaults.standard.integer(forKey: "PZPartBytes"))
+        return debug > 0 ? debug : 4_000_000_000
+        #else
+        4_000_000_000
+        #endif
+    }
+
     /// One zip of an export. With a drive, the export is a run of these.
     struct Part {
         let zip: URL
@@ -271,6 +442,8 @@ final class Exporter: ObservableObject {
         let carried: Prepared?
         let manifest: ExportManifest
         let skipped: [String]
+        /// Photo files only in iCloud, held back for the user to decide on.
+        let held: [ExportItem]
     }
 
     /// An item fetched (and in Save Space mode re-encoded) to a local file,
@@ -285,16 +458,52 @@ final class Exporter: ObservableObject {
     private nonisolated static func items(photos: Bool, videos: Bool, saver: SpaceSaver?,
                                           folders: [PickedFolder]) -> [ExportItem] {
         var paths = ZipPathAllocator()
-        var items = PhotoSource.items(photos: photos, videos: videos, saver: saver, paths: &paths).map(ExportItem.photoResource)
+        var items = PhotoSource.items(photos: photos, videos: videos, saver: saver, paths: &paths)
+            .map(ExportItem.photoResource)
         items += FolderSource.items(in: folders, paths: &paths)
         return items
     }
 
-    private nonisolated static func exportName() -> String {
+    /// The same items, now allowed to download from iCloud.
+    private nonisolated static func allowingICloud(_ items: [ExportItem]) -> [ExportItem] {
+        items.map { item in
+            guard case .photoResource(var photo) = item else { return item }
+            photo.allowICloud = true
+            return .photoResource(photo)
+        }
+    }
+
+    /// A photo missing one of its files is never offered for deletion.
+    private nonisolated static func leaveOut(_ item: ExportItem, in manifest: inout ExportManifest) {
+        if case .photoResource(let photo) = item { manifest.incompleteAssets.insert(photo.assetID) }
+    }
+
+    /// "iPhone Export 2024-05-01 18.30 - Photos, Videos & Documents": the
+    /// name says what is inside, taken from what was actually found.
+    private nonisolated static func exportName(for items: [ExportItem]) -> String {
         let stamp = DateFormatter()
         stamp.dateFormat = "yyyy-MM-dd HH.mm"
         stamp.locale = Locale(identifier: "en_US_POSIX")
-        return "iPhone Export \(stamp.string(from: Date()))"
+        var kinds = Set<String>()
+        for item in items {
+            switch item {
+            case .photoResource(let photo):
+                // Photo Library/<kind>/...; screenshots count as photos and
+                // screen recordings as videos, to keep the name short.
+                let kind = photo.pathInZip.split(separator: "/").dropFirst().first.map(String.init) ?? "Photos"
+                kinds.insert(kind == "Screen Recordings" || kind == "Videos" ? "Videos" : "Photos")
+            case .file:
+                kinds.insert("Documents")
+            }
+        }
+        let ordered = ["Photos", "Videos", "Documents"].filter(kinds.contains)
+        let contents: String
+        switch ordered.count {
+        case 0: contents = ""
+        case 1: contents = " - " + ordered[0]
+        default: contents = " - " + ordered.dropLast().joined(separator: ", ") + " & " + ordered.last!
+        }
+        return "iPhone Export \(stamp.string(from: Date()))\(contents)"
     }
 
     /// Never reuses a name: two exports in the same minute must not replace
@@ -325,19 +534,21 @@ final class Exporter: ObservableObject {
     /// before it goes in. ZIPFoundation leaves a zip damaged when an entry
     /// fails halfway, so an entry is only started once it can't fail.
     private nonisolated static func buildZip(
-        _ items: [ExportItem], from start: Int, carrying carried: Prepared?, to zipURL: URL, staging: URL,
-        batchSize: Int?, progress: @escaping (Int, String) -> Void
+        _ items: [ExportItem], from start: Int, carrying carried: Prepared?, to zipURL: URL, appending: Bool,
+        staging: URL, batchSize: Int?, progress: @escaping (Int, String) -> Void
     ) async throws -> Part {
         let inParts = batchSize != nil
         // Anything left half-written is junk, so every failure path removes it.
         var succeeded = false
         defer { if !succeeded { try? FileManager.default.removeItem(at: zipURL) } }
 
-        let archive = try Archive(url: zipURL, accessMode: .create)
+        let archive = try Archive(url: zipURL, accessMode: appending ? .update : .create)
         var skipped: [String] = []
+        var held: [ExportItem] = []
         var manifest = ExportManifest()
         var units = Set<String>()
         var hasEntries = false
+        var bytesInPart: Int64 = 0
         var carried = carried
         var carriedOut: Prepared?
         var index = start
@@ -350,11 +561,12 @@ final class Exporter: ObservableObject {
         while index < items.count {
             try Task.checkCancellation()
             let item = items[index]
-            if let batchSize, !units.contains(item.unit), units.count >= batchSize { break }
+            if let batchSize, !units.contains(item.unit),
+               units.count >= batchSize || bytesInPart >= partBytes { break }
             units.insert(item.unit)
             progress(index, item.displayName)
 
-            // 1. A local copy, downloaded from iCloud if need be, and
+            // 1. A local copy (from iCloud only once the user said yes), and
             // re-encoded in Save Space mode.
             let prepared: Prepared
             if let ready = carried {
@@ -376,6 +588,10 @@ final class Exporter: ObservableObject {
                         // Try it again in the next part, once this zip is off the phone.
                         if hasEntries { break }
                         skip(item, "too big for the free space on this iPhone")
+                    } else if PhotoSource.isICloudOnly(error) {
+                        // Never downloaded without asking: held back until
+                        // the rest is done, then the user decides.
+                        held.append(item)
                     } else {
                         skip(item, error.localizedDescription)
                     }
@@ -419,23 +635,37 @@ final class Exporter: ObservableObject {
                 if isOutOfSpace(error) { throw inParts ? PhoneFull() : OutOfSpace() }
                 throw ZipDamaged(file: item.displayName, reason: error.localizedDescription)
             }
+            bytesInPart += fileSize(temp)
             try? FileManager.default.removeItem(at: temp)
             hasEntries = true
             index += 1
         }
 
-        // On the phone, the list of what didn't make it goes inside the zip.
-        // In parts, the caller writes one list for all of them onto the drive.
-        if !inParts && !skipped.isEmpty {
-            let report = Data(("Not included in this export:\n\n" + skipped.joined(separator: "\n")).utf8)
-            try archive.addEntry(with: "Skipped files.txt", type: .file, uncompressedSize: Int64(report.count)) { position, size in
-                report.subdata(in: Int(position)..<Int(position) + size)
-            }
-        }
-
         progress(index, "")
         succeeded = true
-        return Part(zip: zipURL, next: index, carried: carriedOut, manifest: manifest, skipped: skipped)
+        return Part(zip: zipURL, next: index, carried: carriedOut, manifest: manifest, skipped: skipped, held: held)
+    }
+
+    /// Adds "Skipped files.txt" to a finished zip that stays on the phone.
+    private nonisolated static func appendReport(_ text: String, to zipURL: URL) throws {
+        let archive = try Archive(url: zipURL, accessMode: .update)
+        let report = Data(text.utf8)
+        try archive.addEntry(with: "Skipped files.txt", type: .file, uncompressedSize: Int64(report.count)) { position, size in
+            report.subdata(in: Int(position)..<Int(position) + size)
+        }
+    }
+
+    private nonisolated static func skippedReport(_ skipped: [String], inICloud: [String]) -> String {
+        var report = ""
+        if !skipped.isEmpty {
+            report += "Not included in this export:\n\n" + skipped.joined(separator: "\n") + "\n"
+        }
+        if !inICloud.isEmpty {
+            if !report.isEmpty { report += "\n" }
+            report += "Stored only in iCloud and left there (you chose not to download them):\n\n"
+                + inICloud.joined(separator: "\n") + "\n"
+        }
+        return report
     }
 
     /// In Save Space mode, swaps the fetched file for a re-encoded one. If

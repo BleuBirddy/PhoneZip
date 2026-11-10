@@ -29,7 +29,8 @@ final class PickedFolder: Identifiable {
 }
 
 enum FolderSource {
-    /// Every regular file under each folder, filed as Files/<folder>/<subpath>.
+    /// Every regular file under each folder, filed under Documents by where
+    /// the folder is, as Files shows it: Documents/iCloud Drive/Work/<subpath>.
     /// Hidden files are skipped (.DS_Store and app caches nobody wants back).
     static func items(in folders: [PickedFolder], paths: inout ZipPathAllocator) -> [ExportItem] {
         // PhoneZip's own folder is pickable too. Without this, an export would
@@ -63,10 +64,43 @@ enum FolderSource {
                 let full = file.standardizedFileURL.resolvingSymlinksInPath().path
                 if full.hasPrefix(ownFolder) { continue }
                 let relative = full.hasPrefix(base.path + "/") ? String(full.dropFirst(base.path.count + 1)) : file.lastPathComponent
-                result.append(.file(url: file, pathInZip: paths.unique("Files/\(folder.name)/\(relative)")))
+                result.append(.file(url: file, pathInZip: paths.unique("Documents/\(label(for: folder))/\(relative)")))
             }
         }
         return result
+    }
+
+    /// Where a picked folder is, the way Files shows it: its location
+    /// (iCloud Drive, On My iPhone, or a drive's name) and the folders
+    /// below that. An app's own folder is labeled with the app's name.
+    static func label(for folder: PickedFolder) -> String {
+        let parts = folder.url.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        func below(_ marker: String) -> [String]? {
+            parts.firstIndex(of: marker).map { Array(parts[($0 + 1)...]) }
+        }
+        let location: String
+        var path: [String]
+        if let rest = below("com~apple~CloudDocs") {
+            location = "iCloud Drive"
+            path = rest
+        } else if parts.contains("Mobile Documents") {
+            location = "iCloud Drive"          // an app's iCloud folder
+            path = [folder.name]
+        } else if let rest = below("File Provider Storage") {
+            location = "On My \(UIDevice.current.model)"
+            path = rest
+        } else if parts.contains("Containers") {
+            location = "On My \(UIDevice.current.model)"   // an app's own folder
+            path = [folder.name]
+        } else {
+            // A USB drive or another volume: its name, then the path on it.
+            let volume = try? folder.url.resourceValues(forKeys: [.volumeURLKey, .volumeLocalizedNameKey])
+            location = volume?.volumeLocalizedName ?? "Other"
+            let root = volume?.volume?.standardizedFileURL.resolvingSymlinksInPath().pathComponents.count ?? parts.count - 1
+            path = Array(parts.dropFirst(min(root, parts.count)))
+        }
+        path = path.map { $0.replacingOccurrences(of: "/", with: "-") }
+        return ([location] + path).joined(separator: "/")
     }
 
     /// Copies the file to `temp`, downloading it first if it is only in

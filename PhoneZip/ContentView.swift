@@ -48,7 +48,9 @@ struct ContentView: View {
         NavigationStack {
             Form {
                 switch exporter.state {
-                case .preparing, .running, .moving, .deleting:
+                case .askingICloud(let photos):
+                    iCloudQuestion(photos)
+                case .preparing, .running, .checking, .moving, .deleting:
                     progressSection
                 case .finished(let result):
                     finishedSection(result)
@@ -107,8 +109,10 @@ struct ContentView: View {
             }
             .alert("Delete from this iPhone?", isPresented: $confirmingDelete) {
                 Button("Delete", role: .destructive) {
-                    if case .moved(let summary) = exporter.state {
-                        exporter.deleteOriginals(summary)
+                    switch exporter.state {
+                    case .moved(let summary): exporter.deleteOriginals(summary)
+                    case .finished(let result): exporter.deleteOriginals(result)
+                    default: break
                     }
                 }
                 // Return on a hardware keyboard presses this one, never Delete.
@@ -151,7 +155,7 @@ struct ContentView: View {
             if photoStatus == .limited {
                 Text("You gave access to selected photos only, so only those will be exported. Choose \"Full Access\" in Settings > PhoneZip > Photos to export everything.")
             } else if canSeePhotos {
-                Text("Includes edits (with their originals), Live Photo videos, and hidden photos. Photos kept only in iCloud are downloaded first, which can take a while.")
+                Text("Includes edits (with their originals), Live Photo videos, and hidden photos. If some photos are kept only in iCloud (\"Optimize iPhone Storage\"), PhoneZip asks before downloading them. Shared Albums aren't included.")
             }
         }
     }
@@ -207,7 +211,7 @@ struct ContentView: View {
         } header: {
             Text("USB Drive")
         } footer: {
-            Text("Goes in parts of up to 500 items (fewer when the iPhone runs low on space): each part is zipped, unzipped onto the drive, checked and removed from the iPhone before the next one. Keep PhoneZip open and the drive plugged in until it's done; the screen stays on.")
+            Text("Goes in parts of up to 500 items or 4 GB (fewer when the iPhone runs low on space): each part is zipped, unzipped onto the drive, checked and removed from the iPhone before the next one. Keep PhoneZip open and the drive plugged in until it's done; the screen stays on.")
         }
     }
 
@@ -217,8 +221,11 @@ struct ContentView: View {
     private var progressSection: some View {
         Section {
             switch exporter.state {
+            case .checking(let part, let done, let total, let current) where total > 0:
+                progress(part > 0 ? "Part \(part): checking the zip" : "Checking the zip", done, total, current)
             case .running(let part, let done, let total, let current) where total > 0:
-                let verb = saver != nil ? "shrinking and zipping" : "zipping"
+                let verb = exporter.fromICloud ? "downloading from iCloud"
+                    : saver != nil ? "shrinking and zipping" : "zipping"
                 progress(part > 0 ? "Part \(part): \(verb)" : verb.prefix(1).uppercased() + verb.dropFirst(),
                          done, total, current)
             case .moving(let part, let done, let total, let current) where total > 0:
@@ -255,6 +262,37 @@ struct ContentView: View {
         }
     }
 
+    /// Groups "path: reason" lines by reason, most common first, so the
+    /// cause shows on screen instead of only in "Skipped files.txt".
+    private func failureReasons(_ failed: [String]) -> [(reason: String, count: Int)] {
+        var counts: [String: Int] = [:]
+        for line in failed {
+            let reason = line.range(of: ": ").map { String(line[$0.upperBound...]) } ?? line
+            counts[reason, default: 0] += 1
+        }
+        return counts.sorted { $0.value > $1.value }.prefix(3).map { (reason: $0.key, count: $0.value) }
+    }
+
+    // MARK: Photos kept in iCloud
+
+    private func iCloudQuestion(_ photos: Int) -> some View {
+        Section {
+            Label("\(photos.formatted()) \(photos == 1 ? "photo is" : "photos are") only in iCloud",
+                  systemImage: "icloud")
+            Button {
+                exporter.answerICloud(true)
+            } label: {
+                Label("Download from iCloud", systemImage: "icloud.and.arrow.down")
+            }
+            Button("Leave Them Out") { exporter.answerICloud(false) }
+            Button("Cancel Export", role: .destructive) { exporter.cancel() }
+        } header: {
+            Text("Download from iCloud?")
+        } footer: {
+            Text("Everything already on this iPhone has been exported. These photos are stored in iCloud (\"Optimize iPhone Storage\"), and only a small preview is on the phone. Downloading them can take a while and may use mobile data. If you leave them out, they're listed in \"Skipped files.txt\" and won't be deleted from this iPhone.")
+        }
+    }
+
     // MARK: After the zip
 
     private func finishedSection(_ result: Exporter.Result) -> some View {
@@ -264,6 +302,10 @@ struct ContentView: View {
             if result.skipped > 0 {
                 Text("\(result.skipped) item(s) couldn't be read. Their names are in \"Skipped files.txt\" inside the zip.")
                     .foregroundStyle(.orange)
+            }
+            if result.inICloud > 0 {
+                Text("\(result.inICloud) photo file(s) were left in iCloud, as you chose. Their names are in \"Skipped files.txt\" inside the zip.")
+                    .foregroundStyle(.secondary)
             }
             if let drive {
                 Button {
@@ -280,6 +322,11 @@ struct ContentView: View {
                 }
             }
             ShareLink(item: result.zip) { Label("Share or Save…", systemImage: "square.and.arrow.up") }
+            let deletable = DriveTransfer.deletableAssets(result.manifest, verified: result.checkedInZip).count
+                + DriveTransfer.deletableFiles(result.manifest, verified: result.checkedInZip).count
+            if deletable > 0 {
+                Button("Delete Originals from iPhone…", role: .destructive) { confirmingDelete = true }
+            }
             Button("Done") { exporter.reset() }
         } header: {
             Text("Zip Created")
@@ -289,8 +336,8 @@ struct ContentView: View {
     }
 
     private func movedSection(_ summary: Exporter.DriveSummary) -> some View {
-        let photos = DriveTransfer.deletableAssets(summary.manifest, verified: summary.verified).count
-        let files = DriveTransfer.deletableFiles(summary.manifest, verified: summary.verified).count
+        let photos = DriveTransfer.deletableAssets(summary.manifest, verified: summary.safe).count
+        let files = DriveTransfer.deletableFiles(summary.manifest, verified: summary.safe).count
         return Section {
             if let stopped = summary.stopped {
                 Label(stopped, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
@@ -307,16 +354,30 @@ struct ContentView: View {
                 Text("\(summary.skipped) item(s) couldn't be read, so they weren't copied and stay on this iPhone. Their names are in \"Skipped files.txt\".")
                     .foregroundStyle(.orange)
             }
+            if summary.inICloud > 0 {
+                Text("\(summary.inICloud) photo file(s) were left in iCloud, as you chose, so those photos won't be deleted from this iPhone. Their names are in \"Skipped files.txt\".")
+                    .foregroundStyle(.secondary)
+            }
             if !summary.failed.isEmpty {
                 Text("\(summary.failed.count) file(s) didn't copy correctly. Their originals stay on this iPhone.")
                     .foregroundStyle(.orange)
+                ForEach(failureReasons(summary.failed), id: \.reason) { group in
+                    LabeledContent(group.reason, value: "\(group.count) file(s)")
+                        .font(.footnote)
+                }
             }
             if !summary.manifest.shrunkAssets.isEmpty {
                 Text("\(summary.manifest.shrunkAssets.count.formatted()) photos and videos went to the drive at lower quality (Save Space), so their full-quality originals stay on this iPhone and can't be deleted here.")
                     .foregroundStyle(.orange)
             }
-            Button("Delete Originals from iPhone…", role: .destructive) { confirmingDelete = true }
-                .disabled(photos + files == 0)
+            if photos + files > 0 {
+                Button("Delete Originals from iPhone…", role: .destructive) { confirmingDelete = true }
+            } else {
+                // Say why, instead of a grey button that looks broken.
+                Label("Nothing can be deleted from this iPhone: none of the copies on the drive could be confirmed, so every original stays.",
+                      systemImage: "lock.shield")
+                    .foregroundStyle(.secondary)
+            }
             Button("Keep Them") { exporter.reset() }
         } header: {
             Text("On the Drive")
@@ -351,16 +412,37 @@ struct ContentView: View {
 
     /// What deleting will do, spelled out before anything happens.
     private var deleteWarning: String {
-        guard case .moved(let summary) = exporter.state else { return "" }
-        let photos = DriveTransfer.deletableAssets(summary.manifest, verified: summary.verified).count
-        let files = DriveTransfer.deletableFiles(summary.manifest, verified: summary.verified).count
+        let manifest: ExportManifest, safe: Set<String>, whereSafe: String
+        switch exporter.state {
+        case .moved(let summary):
+            (manifest, safe) = (summary.manifest, summary.safe)
+            whereSafe = summary.keptInZips.isEmpty ? "are safely on the drive" : "have a checked copy (on the drive, or in a zip kept on this iPhone)"
+        case .finished(let result):
+            (manifest, safe) = (result.manifest, result.checkedInZip)
+            whereSafe = "are in the zip, checked, and"
+        default:
+            return ""
+        }
+        let photos = DriveTransfer.deletableAssets(manifest, verified: safe).count
+        let files = DriveTransfer.deletableFiles(manifest, verified: safe).count
+        let zipOnly = if case .finished = exporter.state {
+            "\n\nThe zip will then be the only copy, and it is on this iPhone. Move it to a drive or computer before deleting it, or they are gone."
+        } else { "" }
         return """
-        \(photos.formatted()) photos and videos and \(files.formatted()) files are safely on the drive and will be deleted from this iPhone.
+        \(photos.formatted()) photos and videos and \(files.formatted()) files \(whereSafe) will be deleted from this iPhone.\(zipOnly)
 
         If iCloud Photos is on, the photos are also removed from iCloud and your other devices. Files from iCloud Drive are removed from iCloud too.
 
         Deleted photos stay in Photos › Recently Deleted for 30 days, and only free up space once that's emptied. Albums, favorites and captions aren't part of the copy.
         """
+    }
+
+    /// Deleted items go to Recently Deleted, which is easy to mistake for
+    /// "nothing happened" since the space only comes back once it's emptied.
+    private func recentlyDeletedNote(_ report: DeleteReport) -> String {
+        let places = [report.photosDeleted > 0 ? "Photos › Recently Deleted" : nil,
+                      report.filesDeleted > 0 ? "Files › Browse › Recently Deleted" : nil].compactMap { $0 }
+        return "They're in \(places.joined(separator: " and ")) for 30 days, where they can still be recovered. The space is only freed once you empty \(places.count > 1 ? "those" : "it")."
     }
 
     private func cleanedSection(_ report: DeleteReport) -> some View {
@@ -381,8 +463,8 @@ struct ContentView: View {
         } header: {
             Text("Cleaned Up")
         } footer: {
-            if report.photosDeleted > 0 {
-                Text("To free the space now, empty Photos › Recently Deleted. Until then they can still be recovered.")
+            if report.photosDeleted > 0 || report.filesDeleted > 0 {
+                Text(recentlyDeletedNote(report))
             }
         }
     }

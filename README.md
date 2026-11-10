@@ -4,7 +4,7 @@
 
 An iPhone app that copies your photos, videos and documents onto a USB
 drive, checks every file, and then (if you say so) deletes the originals
-from the phone. It goes in parts of up to 500 items, each zipped, unzipped
+from the phone. It goes in parts of up to 500 items or 4 GB, each zipped, unzipped
 onto the drive and checked, so a library far bigger than the phone's free
 space (say 3,000 videos, 100 GB) still goes out in one run.
 
@@ -34,25 +34,32 @@ from Files, the export running, and the finished zip.
 ## What goes in the zip
 
 ```
-iPhone Export 2026-10-30 20.17.zip
-├── Photos/
-│   ├── 2024/2024-05/IMG_0001.HEIC
-│   ├── 2024/2024-05/IMG_0001.MOV      ← the Live Photo video, same name
-│   ├── 2024/2024-06/IMG_0042.JPG      ← an edited photo, as it looks in Photos
-│   ├── 2024/2024-06/IMG_0042 (original).HEIC   ← and its untouched original
-│   └── Undated/...
-├── Files/
-│   ├── On My iPhone/...               ← each picked folder, subfolders kept
-│   └── Taxes/...
+iPhone Export 2026-10-30 20.17 - Photos, Videos & Documents.zip
+├── Photo Library/
+│   ├── Photos/2024/2024-05/IMG_0001.HEIC
+│   ├── Photos/2024/2024-05/IMG_0001.MOV      ← the Live Photo video, same name
+│   ├── Photos/2024/2024-06/IMG_0042.JPG      ← an edited photo, as it looks in Photos
+│   ├── Photos/2024/2024-06/IMG_0042 (original).HEIC   ← and its untouched original
+│   ├── Videos/2024/2024-07/IMG_0050.MOV
+│   ├── Screenshots/2024/2024-07/IMG_0051.PNG
+│   ├── Screen Recordings/...
+│   └── Photos/Undated/...
+├── Documents/                         ← each picked folder, by where it is
+│   ├── On My iPhone/Downloads/...     ← subfolders kept
+│   └── iCloud Drive/Taxes/...
 └── Skipped files.txt                  ← only if something couldn't be read
 ```
 
-- **Photos and videos:** the whole library, oldest first, filed by the month
-  they were taken. Edited photos and videos are exported as you see them in
+- **Photos and videos:** the whole library, oldest first, filed by kind
+  (photos, videos, screenshots, screen recordings) and the month they were
+  taken. The export's name says what it holds. Edited photos and videos are exported as you see them in
   Photos, plus their untouched original (`… (original).HEIC`), so nothing is
   lost if the phone's copy is deleted later. Live Photos include their video,
-  RAW+JPEG pairs include the RAW, and hidden photos are included. Photos kept only in iCloud ("Optimize iPhone Storage")
-  are downloaded during the export.
+  RAW+JPEG pairs include the RAW, and hidden photos are included. Photos kept
+  only in iCloud ("Optimize iPhone Storage") are never downloaded without
+  asking: once everything on the phone is exported, PhoneZip asks whether to
+  download them or leave them out (listed in `Skipped files.txt`). Shared
+  Albums are never included.
 - **Documents:** iOS never lets an app read every file on the phone. Instead
   you pick folders in the Files picker (On My iPhone, iCloud Drive, ...) and
   everything inside them goes in. App folders under On My iPhone (the ones with
@@ -91,8 +98,9 @@ the full-quality original always stays on the phone.
    button reads **Copy to *drive name*** as soon as it's plugged in.
 4. Tap **Copy to *drive name***. Keep the app open, and the phone and drive
    plugged in; the screen stays on while it works. PhoneZip goes in parts:
-   - it zips up to 500 items (a photo with its Live Photo video or original
-     counts once), or fewer when the phone gets low on space,
+   - it zips up to 500 items or 4 GB, whichever comes first (a photo with
+     its Live Photo video or original counts once), or fewer when the phone
+     gets low on space,
    - unzips that part into one folder on the drive
      (`iPhone Export 2026-10-30 20.17/`), reads every file back to check it,
    - removes the part's zip from the phone, and starts the next part.

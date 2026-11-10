@@ -19,6 +19,10 @@ enum PhotoSource {
         /// Where the untouched file goes if re-encoding fails. A shrunk photo
         /// is renamed to .HEIC, so its original name is reserved too.
         var fallbackPath: String? = nil
+        /// Only once the user agreed to download photos kept in iCloud may
+        /// PhotoKit fetch this file over the network. Until then a file that
+        /// isn't on the phone is held back (see `isICloudOnly`).
+        var allowICloud = false
     }
 
     static func requestAccess() async -> PHAuthorizationStatus {
@@ -32,13 +36,32 @@ enum PhotoSource {
     /// Counts without touching any file data, so the screen can show
     /// "1,204 photos · 87 videos" instantly.
     static func counts() -> (photos: Int, videos: Int) {
-        (PHAsset.fetchAssets(with: .image, options: nil).count,
-         PHAsset.fetchAssets(with: .video, options: nil).count)
+        (PHAsset.fetchAssets(with: .image, options: libraryOnly()).count,
+         PHAsset.fetchAssets(with: .video, options: libraryOnly()).count)
     }
 
-    /// Lists every file to export, oldest first, filed as Photos/2024/2024-05/.
-    static func items(photos: Bool, videos: Bool, saver: SpaceSaver?, paths: inout ZipPathAllocator) -> [Item] {
+    /// The user's own library, without Shared Albums: those live in iCloud
+    /// and belong partly to other people.
+    private static func libraryOnly() -> PHFetchOptions {
         let options = PHFetchOptions()
+        options.includeAssetSourceTypes = [.typeUserLibrary, .typeiTunesSynced]
+        return options
+    }
+
+    /// Where an asset is filed inside "Photo Library": what it is, so videos
+    /// and screenshots aren't mixed in with photos.
+    static func kindFolder(for asset: PHAsset) -> String {
+        if asset.mediaType == .video {
+            return asset.mediaSubtypes.contains(.videoScreenRecording) ? "Screen Recordings" : "Videos"
+        }
+        return asset.mediaSubtypes.contains(.photoScreenshot) ? "Screenshots" : "Photos"
+    }
+
+    /// Lists every file to export, oldest first, filed by kind and month, as
+    /// Photo Library/Videos/2024/2024-05/. A Live Photo's video stays with
+    /// its photo.
+    static func items(photos: Bool, videos: Bool, saver: SpaceSaver?, paths: inout ZipPathAllocator) -> [Item] {
+        let options = libraryOnly()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
         options.includeHiddenAssets = true
         var types: [Int] = []
@@ -57,20 +80,23 @@ enum PhotoSource {
         var result: [Item] = []
         for index in 0..<assets.count {
             let asset = assets.object(at: index)
-            let folder = asset.creationDate.map { "Photos/" + folderFormat.string(from: $0) } ?? "Photos/Undated"
+            let kind = "Photo Library/" + kindFolder(for: asset)
+            let folder = kind + "/" + (asset.creationDate.map { folderFormat.string(from: $0) } ?? "Undated")
             for (resource, name) in exportResources(for: asset) {
                 let original = "\(folder)/\(name)"
+                let item: Item
                 switch saver.flatMap({ shrinkKind(resource, $0) }) {
                 case .photo:
                     let heic = (original as NSString).deletingPathExtension + ".HEIC"
-                    result.append(Item(resource: resource, pathInZip: paths.unique(heic), assetID: asset.localIdentifier,
-                                       shrink: .photo, fallbackPath: paths.unique(original)))
+                    item = Item(resource: resource, pathInZip: paths.unique(heic), assetID: asset.localIdentifier,
+                                shrink: .photo, fallbackPath: paths.unique(original))
                 case .video:
-                    result.append(Item(resource: resource, pathInZip: paths.unique(original),
-                                       assetID: asset.localIdentifier, shrink: .video))
+                    item = Item(resource: resource, pathInZip: paths.unique(original),
+                                assetID: asset.localIdentifier, shrink: .video)
                 case nil:
-                    result.append(Item(resource: resource, pathInZip: paths.unique(original), assetID: asset.localIdentifier))
+                    item = Item(resource: resource, pathInZip: paths.unique(original), assetID: asset.localIdentifier)
                 }
+                result.append(item)
             }
         }
         return result
@@ -140,12 +166,29 @@ enum PhotoSource {
         return picked
     }
 
-    /// Copies one resource to a local file. Photos stored only in iCloud
-    /// ("Optimize iPhone Storage") get downloaded here, which is the slow part
-    /// of most exports.
+    /// Copies one resource to a local file. A file kept only in iCloud
+    /// ("Optimize iPhone Storage") is downloaded only when the user allowed
+    /// it; otherwise PhotoKit refuses (see `isICloudOnly`).
     static func write(_ item: Item, to url: URL) async throws {
+        #if DEBUG
+        // For testing without iCloud: -PZFakeICloud YES on launch makes about
+        // a third of the photos act as if they were only in iCloud.
+        if !item.allowICloud, UserDefaults.standard.bool(forKey: "PZFakeICloud"),
+           item.assetID.unicodeScalars.reduce(0, { $0 + Int($1.value) }) % 3 == 0 {
+            throw PHPhotosError(.networkAccessRequired)
+        }
+        #endif
         let options = PHAssetResourceRequestOptions()
-        options.isNetworkAccessAllowed = true
+        options.isNetworkAccessAllowed = item.allowICloud
         try await PHAssetResourceManager.default().writeData(for: item.resource, toFile: url, options: options)
+    }
+
+    /// True when a read failed only because the file is in iCloud and not on
+    /// this iPhone, and downloading it wasn't allowed.
+    static func isICloudOnly(_ error: Error) -> Bool {
+        if let photos = error as? PHPhotosError, photos.code == .networkAccessRequired { return true }
+        let ns = error as NSError
+        return (ns.domain == PHPhotosErrorDomain && ns.code == PHPhotosError.Code.networkAccessRequired.rawValue)
+            || ns.domain == "CloudPhotoLibraryErrorDomain"
     }
 }

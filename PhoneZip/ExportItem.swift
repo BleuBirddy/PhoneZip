@@ -20,6 +20,9 @@ struct ExportManifest {
     var shrunkAssets = Set<String>()
     /// Path in the zip → the document it was copied from.
     var files: [String: URL] = [:]
+    /// The folders the user picked. Folders that deleting leaves empty are
+    /// removed, but never these or anything outside them.
+    var fileRoots: [URL] = []
 
     /// Combines the parts of an export that went out as several zips. A photo
     /// split across two parts keeps all its paths, so it is still deleted
@@ -29,6 +32,7 @@ struct ExportManifest {
         incompleteAssets.formUnion(other.incompleteAssets)
         shrunkAssets.formUnion(other.shrunkAssets)
         files.merge(other.files) { _, new in new }
+        fileRoots += other.fileRoots.filter { !fileRoots.contains($0) }
     }
 }
 

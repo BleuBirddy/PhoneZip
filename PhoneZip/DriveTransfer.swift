@@ -70,6 +70,12 @@ enum DriveTransfer {
         }
     }
 
+    struct DriveGone: LocalizedError {
+        var errorDescription: String? {
+            "The drive was disconnected, or iOS lost access to it, while copying. Nothing was deleted. Plug it back in, choose it again, and start the copy again."
+        }
+    }
+
     struct Mismatch: LocalizedError {
         var errorDescription: String? { "the copy on the drive didn't match the original" }
     }
@@ -103,6 +109,7 @@ enum DriveTransfer {
         zip: URL, into folder: URL,
         progress: @escaping (Int, Int, String) -> Void
     ) throws -> DriveCopy {
+        guard isReachable(folder) else { throw DriveGone() }
         let archive = try Archive(url: zip, accessMode: .read)
         let entries = archive.filter { $0.type == .file }
 
@@ -134,7 +141,7 @@ enum DriveTransfer {
             do {
                 try makeParents(of: dest, in: folder, recording: &created)
                 created.append(dest)
-                let written = try archive.extract(entry, to: dest)
+                let written = try writePlain(entry, from: archive, to: dest)
                 guard written == entry.checksum else { throw Mismatch() }
                 flushToDisk(dest)
                 let (onDisk, size) = try readBack(dest)
@@ -142,6 +149,9 @@ enum DriveTransfer {
                 verified.insert(entry.path)
             } catch {
                 if Exporter.isOutOfSpace(error) { throw DriveFull(needed: needed, free: 0) }
+                // A drive that went away fails every file after it; stop and
+                // say so, instead of listing each file as a bad copy.
+                if !isReachable(folder) { throw DriveGone() }
                 failed.append("\(entry.path): \(error.localizedDescription)")
             }
         }
@@ -150,6 +160,50 @@ enum DriveTransfer {
 
         let zipRemoved = failed.isEmpty && (try? FileManager.default.removeItem(at: zip)) != nil
         return DriveCopy(folder: folder, verified: verified, failed: failed, zipRemoved: zipRemoved)
+    }
+
+    /// Unzips one file without ZIPFoundation's `extract(_:to:)`, which also
+    /// sets Unix permissions on the new file and fails the whole file if the
+    /// drive refuses. exFAT and FAT drives have no such permissions, and on
+    /// iOS that refusal can fail every file even though its bytes were
+    /// written. The date is still copied, if the drive takes it.
+    private static func writePlain(_ entry: Entry, from archive: Archive, to dest: URL) throws -> CRC32 {
+        let fd = open(dest.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO, userInfo: [NSFilePathErrorKey: dest.path])
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        let checksum = try archive.extract(entry) { try handle.write(contentsOf: $0) }
+        try handle.close()
+        if let date = entry.fileAttributes[.modificationDate] as? Date {
+            try? FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: dest.path)
+        }
+        return checksum
+    }
+
+    /// Reads every file back out of a finished zip and checks it against the
+    /// checksum stored when it went in. Only what reads back correctly may
+    /// have its original deleted while the zip is the copy.
+    nonisolated static func verifyZip(_ zip: URL, progress: (Int, Int, String) -> Void) throws -> Set<String> {
+        let archive = try Archive(url: zip, accessMode: .read)
+        let entries = archive.filter { $0.type == .file }
+        var good = Set<String>()
+        for (index, entry) in entries.enumerated() {
+            try Task.checkCancellation()
+            progress(index, entries.count, (entry.path as NSString).lastPathComponent)
+            if let crc = try? archive.extract(entry, skipCRC32: false, consumer: { _ in }), crc == entry.checksum {
+                good.insert(entry.path)
+            }
+        }
+        progress(entries.count, entries.count, "")
+        return good
+    }
+
+    /// Whether the export folder on the drive can still be reached.
+    nonisolated static func isReachable(_ folder: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        return (try? folder.checkResourceIsReachable()) == true
+            && FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory) && isDirectory.boolValue
     }
 
     /// Creates the folders above `dest`, noting each new one so a cancelled
@@ -214,8 +268,23 @@ enum DriveTransfer {
         manifest.files.compactMap { path, url in verified.contains(path) ? url : nil }
     }
 
-    static func deleteOriginals(_ manifest: ExportManifest, verified: Set<String>) async -> DeleteReport {
+    /// `checked` are the paths with a checked copy: on the drive in `folder`,
+    /// or inside a checked zip on this iPhone (`inZips`: path → zip).
+    static func deleteOriginals(_ manifest: ExportManifest, verified checked: Set<String>, on folder: URL?,
+                                inZips: [String: URL] = [:]) async -> DeleteReport {
         var report = DeleteReport()
+
+        // Checked earlier isn't enough: the drive may have been unplugged, or
+        // the zip deleted, since. Only a copy that is still there counts.
+        let driveThere = folder.map(isReachable) ?? false
+        let verified = checked.filter { path in
+            if let zip = inZips[path], FileManager.default.fileExists(atPath: zip.path) { return true }
+            guard driveThere, let folder else { return false }
+            return FileManager.default.fileExists(atPath: folder.appendingPathComponent(path).path)
+        }
+        if verified.count < checked.count {
+            report.problems.append("\(checked.count - verified.count) file(s) no longer have their copy (drive unplugged, or the zip removed?), so their originals were kept.")
+        }
 
         let ids = deletableAssets(manifest, verified: verified)
         if !ids.isEmpty {
@@ -236,15 +305,35 @@ enum DriveTransfer {
             }
         }
 
+        var emptied = Set<URL>()
         for url in deletableFiles(manifest, verified: verified) {
             do {
                 try delete(url)
                 report.filesDeleted += 1
+                emptied.insert(url.deletingLastPathComponent())
             } catch {
                 report.problems.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
+        removeEmptyFolders(emptied, inside: manifest.fileRoots)
         return report
+    }
+
+    /// Removes folders the deletion left empty, so the picked folder doesn't
+    /// keep a tree of empty subfolders that looks as if nothing was deleted.
+    /// Only folders inside a picked folder go; the picked folder itself stays,
+    /// and a folder with anything left in it is never touched.
+    private static func removeEmptyFolders(_ folders: Set<URL>, inside roots: [URL]) {
+        let rootPaths = roots.map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
+        // Deepest first, so a parent is looked at after its children.
+        for start in folders.sorted(by: { $0.pathComponents.count > $1.pathComponents.count }) {
+            var dir = start.standardizedFileURL.resolvingSymlinksInPath()
+            while rootPaths.contains(where: { dir.path.hasPrefix($0 + "/") }),
+                  (try? FileManager.default.contentsOfDirectory(atPath: dir.path))?.isEmpty == true {
+                guard (try? delete(dir)) != nil else { break }
+                dir = dir.deletingLastPathComponent()
+            }
+        }
     }
 
     /// Moves the file to Files' Recently Deleted where the location supports
