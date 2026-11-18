@@ -24,6 +24,8 @@ struct ContentView: View {
     @State private var confirmingDelete = false
     /// Saved zips swiped away, waiting for a yes: a zip can be the only copy.
     @State private var zipsToDelete: [URL]?
+    /// Width of the screen's form, to keep rows readable on a wide iPad.
+    @State private var formWidth: CGFloat = 0
 
     /// Save Space: re-encode photos (and videos, unless kept) to shrink the
     /// export. Lossy, so starting one always asks first.
@@ -76,13 +78,17 @@ struct ContentView: View {
                         }
                         .disabled(!hasSomethingToExport)
                     } footer: {
-                        Text("Keeps one zip on this iPhone, so it needs free space about the size of everything you export.")
+                        Text("Keeps one zip on this \(Device.name), so it needs free space about the size of everything you export.")
                     }
                 }
                 if !exports.isEmpty && !exporter.isBusy {
                     exportsSection
                 }
             }
+            // On a 13-inch iPad in landscape the rows would stretch edge to
+            // edge; keep them to about 720 pt, centered. No effect on iPhone.
+            .contentMargins(.horizontal, max(0, (formWidth - 720) / 2), for: .scrollContent)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { formWidth = $0 }
             .navigationTitle("PhoneZip")
             .fileImporter(isPresented: $showingPicker, allowedContentTypes: [.folder],
                           allowsMultipleSelection: pickerJob == .sourceFolders) { result in
@@ -120,7 +126,7 @@ struct ContentView: View {
             } message: { zips in
                 Text("\(zips.map(\.lastPathComponent).joined(separator: ", ")) is deleted for good, not moved to Recently Deleted. If you deleted the originals after making it, this zip is the only copy: make sure it is on a drive or computer first.")
             }
-            .alert("Delete from this iPhone?", isPresented: $confirmingDelete) {
+            .alert("Delete from this \(Device.name)?", isPresented: $confirmingDelete) {
                 Button("Delete", role: .destructive) {
                     switch exporter.state {
                     case .moved(let summary): exporter.deleteOriginals(summary)
@@ -168,7 +174,7 @@ struct ContentView: View {
             if photoStatus == .limited {
                 Text("You gave access to selected photos only, so only those will be exported. Choose \"Full Access\" in Settings > PhoneZip > Photos to export everything.")
             } else if canSeePhotos {
-                Text("Includes edits (with their originals), Live Photo videos, and hidden photos. If some photos are kept only in iCloud (\"Optimize iPhone Storage\"), PhoneZip asks before downloading them. Shared Albums aren't included.")
+                Text("Includes edits (with their originals), Live Photo videos, and hidden photos. If some photos are kept only in iCloud (\"Optimize \(Device.name) Storage\"), PhoneZip asks before downloading them. Shared Albums aren't included.")
             }
         }
     }
@@ -183,7 +189,7 @@ struct ContentView: View {
         } header: {
             Text("Documents")
         } footer: {
-            Text("iOS doesn't let apps read all your files. Pick folders instead, like \"On My iPhone\" or iCloud Drive, and everything inside them goes in the zip. App folders (the ones with an app icon) are separate, so add each one you want.")
+            Text("iOS doesn't let apps read all your files. Pick folders instead, like \"On My \(Device.name)\" or iCloud Drive, and everything inside them goes in the zip. App folders (the ones with an app icon) are separate, so add each one you want.")
         }
     }
 
@@ -197,12 +203,12 @@ struct ContentView: View {
             Text("Size")
         } footer: {
             if !saveSpace {
-                Text("Off: every photo and video goes out exactly as it is on this iPhone, at full quality.")
+                Text("Off: every photo and video goes out exactly as it is on this \(Device.name), at full quality.")
             } else if keepOriginalVideos || !includeVideos {
-                Text("Photos are re-encoded as smaller HEICs (about half the size, some fine detail lost). Videos stay at full quality, so the export shrinks much less. Shrunk photos are never deleted from this iPhone.")
+                Text("Photos are re-encoded as smaller HEICs (about half the size, some fine detail lost). Videos stay at full quality, so the export shrinks much less. Shrunk photos are never deleted from this \(Device.name).")
                     .foregroundStyle(.orange)
             } else {
-                Text("Photos are re-encoded as smaller HEICs and videos as 1080p HEVC. A 3.4 GB export with lots of 4K video typically ends up under 1 GB, but quality is lost for good. Shrunk photos and videos are never deleted from this iPhone.")
+                Text("Photos are re-encoded as smaller HEICs and videos as 1080p HEVC. A 3.4 GB export with lots of 4K video typically ends up under 1 GB, but quality is lost for good. Shrunk photos and videos are never deleted from this \(Device.name).")
                     .foregroundStyle(.orange)
             }
         }
@@ -224,7 +230,7 @@ struct ContentView: View {
         } header: {
             Text("USB Drive")
         } footer: {
-            Text("Goes in parts of up to 500 items or 4 GB (fewer when the iPhone runs low on space): each part is zipped, unzipped onto the drive, checked and removed from the iPhone before the next one. Keep PhoneZip open and the drive plugged in until it's done; the screen stays on.")
+            Text("Goes in parts of up to 500 items or 4 GB (fewer when the \(Device.name) runs low on space): each part is zipped, unzipped onto the drive, checked and removed from the \(Device.name) before the next one. Keep PhoneZip open and the drive plugged in until it's done; the screen stays on.")
         }
     }
 
@@ -302,7 +308,7 @@ struct ContentView: View {
         } header: {
             Text("Download from iCloud?")
         } footer: {
-            Text("Everything already on this iPhone has been exported. These photos are stored in iCloud (\"Optimize iPhone Storage\"), and only a small preview is on the phone. Downloading them can take a while and may use mobile data. If you leave them out, they're listed in \"Skipped files.txt\" and won't be deleted from this iPhone.")
+            Text("Everything already on this \(Device.name) has been exported. These photos are stored in iCloud (\"Optimize \(Device.name) Storage\"), and only a small preview is stored here. Downloading them can take a while and may use mobile data. If you leave them out, they're listed in \"Skipped files.txt\" and won't be deleted from this \(Device.name).")
         }
     }
 
@@ -321,7 +327,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             if result.damaged > 0 {
-                Text("\(result.damaged) file(s) didn't read back correctly from the zip, so their copies can't be trusted. Their originals stay on this iPhone; export again to be safe.")
+                Text("\(result.damaged) file(s) didn't read back correctly from the zip, so their copies can't be trusted. Their originals stay on this \(Device.name); export again to be safe.")
                     .foregroundStyle(.red)
             }
             if let drive {
@@ -342,17 +348,17 @@ struct ContentView: View {
             let deletable = DriveTransfer.deletableAssets(result.manifest, verified: result.checkedInZip).count
                 + DriveTransfer.deletableFiles(result.manifest, verified: result.checkedInZip).count
             if !result.manifest.shrunkAssets.isEmpty {
-                Text("\(result.manifest.shrunkAssets.count.formatted()) photos and videos are in the zip at lower quality (Save Space), so their full-quality originals stay on this iPhone and can't be deleted here.")
+                Text("\(result.manifest.shrunkAssets.count.formatted()) photos and videos are in the zip at lower quality (Save Space), so their full-quality originals stay on this \(Device.name) and can't be deleted here.")
                     .foregroundStyle(.orange)
             }
             if deletable > 0 {
-                Button("Delete Originals from iPhone…", role: .destructive) { confirmingDelete = true }
+                Button("Delete Originals from \(Device.name)…", role: .destructive) { confirmingDelete = true }
             }
             Button("Done") { exporter.reset() }
         } header: {
             Text("Zip Created")
         } footer: {
-            Text("Move to Drive unzips everything onto a USB drive and checks every file, then offers to delete the originals from this iPhone. Plug the drive in first, then choose it (or a folder on it) under Locations.")
+            Text("Move to Drive unzips everything onto a USB drive and checks every file, then offers to delete the originals from this \(Device.name). Plug the drive in first, then choose it (or a folder on it) under Locations.")
         }
     }
 
@@ -375,15 +381,15 @@ struct ContentView: View {
             LabeledContent("Photos and videos that can be deleted", value: photos.formatted())
             LabeledContent("Documents that can be deleted", value: files.formatted())
             if summary.skipped > 0 {
-                Text("\(summary.skipped) item(s) couldn't be read, so they weren't copied and stay on this iPhone. Their names are in \"Skipped files.txt\".")
+                Text("\(summary.skipped) item(s) couldn't be read, so they weren't copied and stay on this \(Device.name). Their names are in \"Skipped files.txt\".")
                     .foregroundStyle(.orange)
             }
             if summary.inICloud > 0 {
-                Text("\(summary.inICloud) photo file(s) were left in iCloud, as you chose, so those photos won't be deleted from this iPhone. Their names are in \"Skipped files.txt\".")
+                Text("\(summary.inICloud) photo file(s) were left in iCloud, as you chose, so those photos won't be deleted from this \(Device.name). Their names are in \"Skipped files.txt\".")
                     .foregroundStyle(.secondary)
             }
             if !summary.failed.isEmpty {
-                Text("\(summary.failed.count) file(s) didn't copy correctly. Their originals stay on this iPhone.")
+                Text("\(summary.failed.count) file(s) didn't copy correctly. Their originals stay on this \(Device.name).")
                     .foregroundStyle(.orange)
                 ForEach(failureReasons(summary.failed), id: \.reason) { group in
                     LabeledContent(group.reason, value: "\(group.count) file(s)")
@@ -391,16 +397,16 @@ struct ContentView: View {
                 }
             }
             if !summary.manifest.shrunkAssets.isEmpty {
-                Text("\(summary.manifest.shrunkAssets.count.formatted()) photos and videos went to the drive at lower quality (Save Space), so their full-quality originals stay on this iPhone and can't be deleted here.")
+                Text("\(summary.manifest.shrunkAssets.count.formatted()) photos and videos went to the drive at lower quality (Save Space), so their full-quality originals stay on this \(Device.name) and can't be deleted here.")
                     .foregroundStyle(.orange)
             }
             if photos + files > 0 {
-                Button("Delete Originals from iPhone…", role: .destructive) { confirmingDelete = true }
+                Button("Delete Originals from \(Device.name)…", role: .destructive) { confirmingDelete = true }
             } else {
                 // Say why, instead of a grey button that looks broken.
                 Label(summary.safe.isEmpty
-                      ? "Nothing can be deleted from this iPhone: none of the copies on the drive could be confirmed, so every original stays."
-                      : "Nothing can be deleted from this iPhone: what was copied is lower quality or incomplete, so every original stays.",
+                      ? "Nothing can be deleted from this \(Device.name): none of the copies on the drive could be confirmed, so every original stays."
+                      : "Nothing can be deleted from this \(Device.name): what was copied is lower quality or incomplete, so every original stays.",
                       systemImage: "lock.shield")
                     .foregroundStyle(.secondary)
             }
@@ -411,9 +417,9 @@ struct ContentView: View {
             if summary.stopped != nil {
                 Text("Only what was copied and checked can be deleted. Run it again later for the rest; it starts a new folder on the drive.")
             } else if summary.zipsKept > 0 {
-                Text("\(summary.zipsKept == 1 ? "A zip was" : "\(summary.zipsKept) zips were") kept on this iPhone because some of their files didn't copy correctly.")
+                Text("\(summary.zipsKept == 1 ? "A zip was" : "\(summary.zipsKept) zips were") kept on this \(Device.name) because some of their files didn't copy correctly.")
             } else {
-                Text("No zips were left on this iPhone; the drive has everything unzipped.")
+                Text("No zips were left on this \(Device.name); the drive has everything unzipped.")
             }
         }
     }
@@ -423,14 +429,14 @@ struct ContentView: View {
         let shrinksVideos = saver.map { !$0.keepOriginalVideos } ?? false
         var lines = ["If you tap Yes, this export will NOT be a full-quality backup:"]
         if includePhotos {
-            lines.append("• Every photo is re-encoded as a smaller HEIC. It looks about the same on a phone, but fine detail is thrown away, and RAW photos become ordinary HEICs that can no longer be edited as RAW.")
+            lines.append("• Every photo is re-encoded as a smaller HEIC. It looks about the same on a screen, but fine detail is thrown away, and RAW photos become ordinary HEICs that can no longer be edited as RAW.")
         }
         if shrinksVideos {
             lines.append("• Every video, including Live Photo videos, is re-encoded to 1080p HEVC. 4K, 60 fps and high-bitrate footage permanently loses resolution and sharpness.")
         } else {
             lines.append("• Videos are copied exactly as they are, at full quality.")
         }
-        lines.append("• The lost quality can never be recovered from this export. The only full-quality copies are the originals on this iPhone (and in iCloud Photos, if it's on).")
+        lines.append("• The lost quality can never be recovered from this export. The only full-quality copies are the originals on this \(Device.name) (and in iCloud Photos, if it's on).")
         lines.append("• Because of that, PhoneZip will never offer to delete anything it shrank. If you delete those photos or videos yourself later, the full-quality versions are gone forever.")
         lines.append("• Re-encoding is much slower than a normal export and uses a lot of battery. Documents from folders are never changed.")
         return lines.joined(separator: "\n\n")
@@ -442,7 +448,7 @@ struct ContentView: View {
         switch exporter.state {
         case .moved(let summary):
             (manifest, safe) = (summary.manifest, summary.safe)
-            whereSafe = summary.keptInZips.isEmpty ? "are safely on the drive" : "each have a checked copy (on the drive, or in a zip kept on this iPhone)"
+            whereSafe = summary.keptInZips.isEmpty ? "are safely on the drive" : "each have a checked copy (on the drive, or in a zip kept on this \(Device.name))"
         case .finished(let result):
             (manifest, safe) = (result.manifest, result.checkedInZip)
             whereSafe = "are in the zip, which was checked"
@@ -452,10 +458,10 @@ struct ContentView: View {
         let photos = DriveTransfer.deletableAssets(manifest, verified: safe).count
         let files = DriveTransfer.deletableFiles(manifest, verified: safe).count
         let zipOnly = if case .finished = exporter.state {
-            "\n\nThe zip will then be the only copy, and it is on this iPhone. Move it to a drive or computer before deleting it, or they are gone."
+            "\n\nThe zip will then be the only copy, and it is on this \(Device.name). Move it to a drive or computer before deleting it, or they are gone."
         } else { "" }
         return """
-        \(photos.formatted()) photos and videos and \(files.formatted()) files will be deleted from this iPhone. They \(whereSafe).\(zipOnly)
+        \(photos.formatted()) photos and videos and \(files.formatted()) files will be deleted from this \(Device.name). They \(whereSafe).\(zipOnly)
 
         If iCloud Photos is on, the photos are also removed from iCloud and your other devices. Files from iCloud Drive are removed from iCloud too.
 
@@ -549,7 +555,7 @@ struct ContentView: View {
         case .drive:
             guard let url = urls.first else { return }
             if DriveStore.isOnThisPhone(url) {
-                pickerError = "That folder is on this iPhone, so it wouldn't be a copy off the phone. Plug in your USB drive and choose it under Locations."
+                pickerError = "That folder is on this \(Device.name), so it wouldn't be a copy anywhere else. Plug in your USB drive and choose it under Locations."
                 return
             }
             let folder = PickedFolder(url: url)

@@ -326,4 +326,9 @@ final class PhoneZipTests: XCTestCase {
         if let flip { zip[flip] ^= 0xFF }
         try zip.write(to: url)
     }
+
+    func testDeviceNameMatchesTheDevice() {
+        // Shown in every message about where the originals stay.
+        XCTAssertTrue(["iPhone", "iPad", "iPod touch", "Mac"].contains(Device.name), Device.name)
+    }
 }

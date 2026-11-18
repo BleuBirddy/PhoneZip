@@ -2,11 +2,15 @@
 
 # PhoneZip
 
-An iPhone app that copies your photos, videos and documents onto a USB
+An iPhone and iPad app that copies your photos, videos and documents onto a USB
 drive, checks every file, and then (if you say so) deletes the originals
 from the phone. It goes in parts of up to 500 items or 4 GB, each zipped, unzipped
 onto the drive and checked, so a library far bigger than the phone's free
 space (say 3,000 videos, 100 GB) still goes out in one run.
+
+Everything below works the same on an iPad; there the app says "iPad"
+wherever this README says "iPhone" (and its exports are named
+`iPad Export …`).
 
 ## Why it exists
 
@@ -300,6 +304,7 @@ first).
 | `PhoneZip/PhotoSource.swift` | Reads the photo library through PhotoKit |
 | `PhoneZip/FolderSource.swift` | Reads folders picked in Files |
 | `PhoneZip/ExportItem.swift` | One item to export, and unique paths inside the zip |
+| `PhoneZip/Device.swift` | Names the device (iPhone, iPad or Mac) in on-screen text |
 | `Tools/make-icon.swift` | Draws the app icon |
 | `docs/screenshots/` | Simulator screenshots used in this README |
 | `PhoneZip/PrivacyInfo.xcprivacy` | Privacy manifest the App Store requires (no tracking, no data collected) |
