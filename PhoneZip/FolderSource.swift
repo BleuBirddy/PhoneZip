@@ -41,7 +41,7 @@ enum FolderSource {
             let base = folder.url.standardizedFileURL.resolvingSymlinksInPath()
             guard let walker = FileManager.default.enumerator(
                 at: base,
-                includingPropertiesForKeys: [.isRegularFileKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
                 options: [.skipsPackageDescendants]
             ) else { continue }
 
@@ -54,7 +54,13 @@ enum FolderSource {
                     // to export (reading it downloads it); any other hidden
                     // item is skipped.
                     guard name.hasSuffix(".icloud"), name.count >= ".x.icloud".count else {
-                        walker.skipDescendants()
+                        // Only for a folder: after a hidden *file* (.DS_Store is
+                        // in nearly every folder) this call makes the walker
+                        // skip the next folder instead, and everything in it
+                        // would silently be left out of the export.
+                        if (try? found.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                            walker.skipDescendants()
+                        }
                         continue
                     }
                     file = found.deletingLastPathComponent().appendingPathComponent(String(name.dropFirst().dropLast(".icloud".count)))
@@ -107,10 +113,22 @@ enum FolderSource {
     /// iCloud. The zip is filled from that local copy, so a download or read
     /// error can't happen halfway through writing an entry (which would leave
     /// the zip damaged). On the same storage the copy is a clone and takes no space.
-    static func copy(_ url: URL, to temp: URL) throws {
+    ///
+    /// Returns when the file was last changed, read at the moment of the
+    /// copy, so a later edit can be told apart before the original is deleted.
+    @discardableResult
+    static func copy(_ url: URL, to temp: URL) throws -> Date? {
+        var changed: Date?
         try withReadableFile(url) { readable in
+            changed = modificationDate(readable)
             try FileManager.default.copyItem(at: readable, to: temp)
         }
+        return changed
+    }
+
+    /// Read fresh from disk every time (URL resource values are cached).
+    static func modificationDate(_ url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
     }
 
     /// Runs `body` with a readable local copy of the file. The coordinator is

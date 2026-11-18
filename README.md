@@ -55,7 +55,9 @@ iPhone Export 2026-10-30 20.17 - Photos, Videos & Documents.zip
   taken. The export's name says what it holds. Edited photos and videos are exported as you see them in
   Photos, plus their untouched original (`… (original).HEIC`), so nothing is
   lost if the phone's copy is deleted later. Live Photos include their video,
-  RAW+JPEG pairs include the RAW, and hidden photos are included. Photos kept
+  RAW+JPEG pairs include the RAW, and hidden photos and every frame of a
+  burst are included. Each exported file is dated when the photo was taken,
+  not when it was exported. Photos kept
   only in iCloud ("Optimize iPhone Storage") are never downloaded without
   asking: once everything on the phone is exported, PhoneZip asks whether to
   download them or leave them out (listed in `Skipped files.txt`). Shared
@@ -114,7 +116,8 @@ the full-quality original always stays on the phone.
 
 You can also skip the drive: **Create Zip Only** builds one zip of
 everything and leaves it in **Files › On My iPhone › PhoneZip** (and under
-Saved Zips, with a Share button) to move another way. That needs free space
+Saved Zips, with a Share button) to move another way. Swiping a saved zip
+away asks first, since it is deleted for good and may be the only copy. That needs free space
 for the whole export, so it only suits smaller exports. **Move to Drive…**
 on the finished zip unzips and checks it the same way.
 
@@ -122,8 +125,14 @@ on the finished zip unzips and checks it the same way.
 
 - Only originals whose copy on the drive was read back and matched are
   deleted. A photo is deleted only if *all* its files (edit, original, Live
-  Photo video, RAW) matched. Anything that failed stays on the phone, along
-  with the zip.
+  Photo video, RAW) were exported and matched, so an export that stopped
+  partway never deletes a photo it only half copied. Anything that failed
+  stays on the phone, along with the zip. A copy that failed its check is
+  removed from the drive, so it can't pass for a backup.
+- A photo, video or document changed after it was copied (edited, cropped,
+  even favorited) is kept, since its copy is no longer current. So are
+  photos synced from a computer, which iOS doesn't let apps delete. Both are
+  reported.
 - Photos go to **Photos › Recently Deleted** for 30 days. The space comes back
   only after that's emptied, and until then they can be recovered.
 - Documents go to Files' **Recently Deleted** where the location has one.
@@ -163,6 +172,9 @@ on the finished zip unzips and checks it the same way.
   Deleted, so deleting doesn't make room for the parts of the same run. The
   parts never need that room anyway, since each part's zip is removed once
   it's on the drive.
+- **File names the drive can't store:** exFAT and FAT drives (and Windows)
+  refuse names with `\ : * ? " < > |` or ones ending in a dot or space. In the
+  export those characters become `_`; the file on the phone keeps its name.
 - **Not encrypted:** the zip and the drive copy are full, readable copies of
   your photos and files. Keep the drive somewhere safe.
 
@@ -246,6 +258,11 @@ Developer Mode on.
 
 Run `xcodegen generate` again after adding, moving or deleting source files.
 
+Unit tests ([`PhoneZipTests`](PhoneZipTests/PhoneZipTests.swift)) cover what
+decides whether an original may be deleted, and failures that are hard to
+produce by hand (a damaged zip, a bad copy on the drive). Run them with
+⌘U in Xcode.
+
 Debug builds take two launch arguments for testing parts with a small
 library: `-PZBatchSize 4` makes parts of 4 items, and `-PZFreeLimit 70000000`
 makes the phone look like it has 70 MB to spare (minus the zips PhoneZip
@@ -285,4 +302,6 @@ first).
 | `PhoneZip/ExportItem.swift` | One item to export, and unique paths inside the zip |
 | `Tools/make-icon.swift` | Draws the app icon |
 | `docs/screenshots/` | Simulator screenshots used in this README |
+| `PhoneZip/PrivacyInfo.xcprivacy` | Privacy manifest the App Store requires (no tracking, no data collected) |
+| `PhoneZipTests/PhoneZipTests.swift` | Unit tests for the delete rules, drive copy checks and Save Space |
 | `project.yml` | XcodeGen project definition (settings, signing, ZIPFoundation version) |

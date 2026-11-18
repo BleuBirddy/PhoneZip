@@ -18,8 +18,18 @@ struct ExportManifest {
     /// Photos with at least one file re-encoded by Save Space. The drive only
     /// has a lower-quality copy, so these are never deleted from the phone.
     var shrunkAssets = Set<String>()
+    /// Photo library item → how many files it has to export. A photo is only
+    /// deleted once that many are copied: an export that stops between two
+    /// parts can leave a Live Photo's still on the drive and its video not.
+    var expectedFiles: [String: Int] = [:]
+    /// Photo library item → when it was last changed, as it was listed. A
+    /// photo edited since then is newer than its copy and is kept.
+    var assetDates: [String: Date] = [:]
     /// Path in the zip → the document it was copied from.
     var files: [String: URL] = [:]
+    /// Path in the zip → when that document was last changed, as it was
+    /// copied. A document edited since then is kept, not deleted.
+    var fileDates: [String: Date] = [:]
     /// The folders the user picked. Folders that deleting leaves empty are
     /// removed, but never these or anything outside them.
     var fileRoots: [URL] = []
@@ -31,7 +41,10 @@ struct ExportManifest {
         for (id, paths) in other.assetPaths { assetPaths[id, default: []] += paths }
         incompleteAssets.formUnion(other.incompleteAssets)
         shrunkAssets.formUnion(other.shrunkAssets)
+        expectedFiles.merge(other.expectedFiles) { max($0, $1) }
+        assetDates.merge(other.assetDates) { old, _ in old }
         files.merge(other.files) { _, new in new }
+        fileDates.merge(other.fileDates) { _, new in new }
         fileRoots += other.fileRoots.filter { !fileRoots.contains($0) }
     }
 }
@@ -66,11 +79,25 @@ extension ExportItem {
 struct ZipPathAllocator {
     private var used = Set<String>()
 
+    /// exFAT and FAT drives (and Windows) refuse names with \ : * ? " < > |
+    /// or control characters, and names ending in a dot or space. iOS allows
+    /// them, so such a file would fail to copy. They become "_" here; the
+    /// file on the phone keeps its name.
+    static func portable(_ path: String) -> String {
+        let banned = Set("\\:*?\"<>|")
+        return path.split(separator: "/", omittingEmptySubsequences: false).map { part -> String in
+            var name = String(part.map { banned.contains($0) || $0.unicodeScalars.allSatisfy { $0.value < 0x20 } ? "_" : $0 })
+            let kept = name.reversed().drop { $0 == "." || $0 == " " }.count
+            if kept < name.count { name = String(name.prefix(kept)) + String(repeating: "_", count: name.count - kept) }
+            return name
+        }.joined(separator: "/")
+    }
+
     mutating func unique(_ path: String) -> String {
         // Apple file systems hand back "é" as e + a separate accent mark.
         // Windows and many zip tools expect the single-character form, and
         // otherwise show "Cafe??" or treat two spellings as different files.
-        let path = path.precomposedStringWithCanonicalMapping
+        let path = Self.portable(path.precomposedStringWithCanonicalMapping)
         guard used.contains(path.lowercased()) else {
             used.insert(path.lowercased())
             return path

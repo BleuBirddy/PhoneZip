@@ -28,6 +28,12 @@ enum Shrinker {
     static func shrinkPhoto(_ source: URL, to destination: URL) throws {
         guard let input = CGImageSourceCreateWithURL(source as CFURL, nil),
               CGImageSourceGetCount(input) > 0 else { throw Failed("not a readable image") }
+        // Only the first frame would survive, turning an animated GIF or PNG
+        // into a still. Failing here sends the untouched original instead.
+        if CGImageSourceGetCount(input) > 1, let type = CGImageSourceGetType(input).flatMap({ UTType($0 as String) }),
+           type.conforms(to: .gif) || type.conforms(to: .png) || type.conforms(to: .webP) {
+            throw Failed("animated image")
+        }
         guard let output = CGImageDestinationCreateWithURL(
             destination as CFURL, UTType.heic.identifier as CFString, 1, nil) else {
             throw Failed("HEIC encoding isn't available")

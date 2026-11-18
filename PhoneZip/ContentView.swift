@@ -22,6 +22,8 @@ struct ContentView: View {
     @State private var showingPicker = false
     @State private var pickerError: String?
     @State private var confirmingDelete = false
+    /// Saved zips swiped away, waiting for a yes: a zip can be the only copy.
+    @State private var zipsToDelete: [URL]?
 
     /// Save Space: re-encode photos (and videos, unless kept) to shrink the
     /// export. Lossy, so starting one always asks first.
@@ -107,6 +109,17 @@ struct ContentView: View {
             } message: { _ in
                 Text(lowQualityWarning)
             }
+            .alert("Delete This Zip?", isPresented: isPresent($zipsToDelete), presenting: zipsToDelete) { zips in
+                Button("Delete", role: .destructive) {
+                    for url in zips { try? FileManager.default.removeItem(at: url) }
+                    exports = Exporter.existingExports()
+                    exporter.reset()
+                }
+                Button("Keep It", role: .cancel) {}
+                    .keyboardShortcut(.defaultAction)
+            } message: { zips in
+                Text("\(zips.map(\.lastPathComponent).joined(separator: ", ")) is deleted for good, not moved to Recently Deleted. If you deleted the originals after making it, this zip is the only copy: make sure it is on a drive or computer first.")
+            }
             .alert("Delete from this iPhone?", isPresented: $confirmingDelete) {
                 Button("Delete", role: .destructive) {
                     switch exporter.state {
@@ -185,7 +198,7 @@ struct ContentView: View {
         } footer: {
             if !saveSpace {
                 Text("Off: every photo and video goes out exactly as it is on this iPhone, at full quality.")
-            } else if keepOriginalVideos {
+            } else if keepOriginalVideos || !includeVideos {
                 Text("Photos are re-encoded as smaller HEICs (about half the size, some fine detail lost). Videos stay at full quality, so the export shrinks much less. Shrunk photos are never deleted from this iPhone.")
                     .foregroundStyle(.orange)
             } else {
@@ -245,7 +258,7 @@ struct ContentView: View {
             if case .moving = exporter.state {
                 Text("Keep PhoneZip open and the drive plugged in. Every file is read back from the drive to make sure it copied correctly.")
             } else if case .deleting = exporter.state {
-                Text("Only files that were checked on the drive are deleted.")
+                Text("Only originals whose copy was checked are deleted.")
             } else if case .running(let part, _, _, _) = exporter.state, part > 0 {
                 Text("Keep PhoneZip open and the drive plugged in. Parts already copied stay on the drive if you cancel.")
             } else {
@@ -307,6 +320,10 @@ struct ContentView: View {
                 Text("\(result.inICloud) photo file(s) were left in iCloud, as you chose. Their names are in \"Skipped files.txt\" inside the zip.")
                     .foregroundStyle(.secondary)
             }
+            if result.damaged > 0 {
+                Text("\(result.damaged) file(s) didn't read back correctly from the zip, so their copies can't be trusted. Their originals stay on this iPhone; export again to be safe.")
+                    .foregroundStyle(.red)
+            }
             if let drive {
                 Button {
                     exporter.move(result, to: drive)
@@ -324,6 +341,10 @@ struct ContentView: View {
             ShareLink(item: result.zip) { Label("Share or Save…", systemImage: "square.and.arrow.up") }
             let deletable = DriveTransfer.deletableAssets(result.manifest, verified: result.checkedInZip).count
                 + DriveTransfer.deletableFiles(result.manifest, verified: result.checkedInZip).count
+            if !result.manifest.shrunkAssets.isEmpty {
+                Text("\(result.manifest.shrunkAssets.count.formatted()) photos and videos are in the zip at lower quality (Save Space), so their full-quality originals stay on this iPhone and can't be deleted here.")
+                    .foregroundStyle(.orange)
+            }
             if deletable > 0 {
                 Button("Delete Originals from iPhone…", role: .destructive) { confirmingDelete = true }
             }
@@ -348,8 +369,11 @@ struct ContentView: View {
             if summary.parts > 1 {
                 LabeledContent("Parts", value: summary.parts.formatted())
             }
-            LabeledContent("Photos and videos", value: photos.formatted())
-            LabeledContent("Files", value: files.formatted())
+            // What reached the drive, then what may leave the phone: the two
+            // differ (Save Space copies are never deleted, for one).
+            LabeledContent("Files copied and checked", value: summary.verified.count.formatted())
+            LabeledContent("Photos and videos that can be deleted", value: photos.formatted())
+            LabeledContent("Documents that can be deleted", value: files.formatted())
             if summary.skipped > 0 {
                 Text("\(summary.skipped) item(s) couldn't be read, so they weren't copied and stay on this iPhone. Their names are in \"Skipped files.txt\".")
                     .foregroundStyle(.orange)
@@ -374,7 +398,9 @@ struct ContentView: View {
                 Button("Delete Originals from iPhone…", role: .destructive) { confirmingDelete = true }
             } else {
                 // Say why, instead of a grey button that looks broken.
-                Label("Nothing can be deleted from this iPhone: none of the copies on the drive could be confirmed, so every original stays.",
+                Label(summary.safe.isEmpty
+                      ? "Nothing can be deleted from this iPhone: none of the copies on the drive could be confirmed, so every original stays."
+                      : "Nothing can be deleted from this iPhone: what was copied is lower quality or incomplete, so every original stays.",
                       systemImage: "lock.shield")
                     .foregroundStyle(.secondary)
             }
@@ -416,10 +442,10 @@ struct ContentView: View {
         switch exporter.state {
         case .moved(let summary):
             (manifest, safe) = (summary.manifest, summary.safe)
-            whereSafe = summary.keptInZips.isEmpty ? "are safely on the drive" : "have a checked copy (on the drive, or in a zip kept on this iPhone)"
+            whereSafe = summary.keptInZips.isEmpty ? "are safely on the drive" : "each have a checked copy (on the drive, or in a zip kept on this iPhone)"
         case .finished(let result):
             (manifest, safe) = (result.manifest, result.checkedInZip)
-            whereSafe = "are in the zip, checked, and"
+            whereSafe = "are in the zip, which was checked"
         default:
             return ""
         }
@@ -429,7 +455,7 @@ struct ContentView: View {
             "\n\nThe zip will then be the only copy, and it is on this iPhone. Move it to a drive or computer before deleting it, or they are gone."
         } else { "" }
         return """
-        \(photos.formatted()) photos and videos and \(files.formatted()) files \(whereSafe) will be deleted from this iPhone.\(zipOnly)
+        \(photos.formatted()) photos and videos and \(files.formatted()) files will be deleted from this iPhone. They \(whereSafe).\(zipOnly)
 
         If iCloud Photos is on, the photos are also removed from iCloud and your other devices. Files from iCloud Drive are removed from iCloud too.
 
@@ -477,11 +503,7 @@ struct ContentView: View {
                                    value: ByteCountFormatter.string(fromByteCount: fileSize(url), countStyle: .file))
                 }
             }
-            .onDelete { offsets in
-                for url in offsets.map({ exports[$0] }) { try? FileManager.default.removeItem(at: url) }
-                exports = Exporter.existingExports()
-                exporter.reset()
-            }
+            .onDelete { offsets in zipsToDelete = offsets.map { exports[$0] } }
         } header: {
             Text("Saved Zips")
         } footer: {
@@ -520,7 +542,10 @@ struct ContentView: View {
     private func picked(_ urls: [URL]) {
         switch pickerJob {
         case .sourceFolders:
-            folders += urls.map(PickedFolder.init)
+            // The same folder twice would put every file in the zip twice.
+            for url in urls where !folders.contains(where: { $0.url.standardizedFileURL == url.standardizedFileURL }) {
+                folders.append(PickedFolder(url: url))
+            }
         case .drive:
             guard let url = urls.first else { return }
             if DriveStore.isOnThisPhone(url) {

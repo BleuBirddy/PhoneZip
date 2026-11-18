@@ -26,6 +26,8 @@ final class Exporter: ObservableObject {
         let manifest: ExportManifest
         /// Paths whose file was read back out of the finished zip and matched.
         let checkedInZip: Set<String>
+        /// Files that went into the zip but didn't read back correctly.
+        let damaged: Int
     }
 
     /// What the copy to the drive left there, over every part of the export.
@@ -79,6 +81,12 @@ final class Exporter: ObservableObject {
     private var task: Task<Void, Never>?
     private var iCloudAnswer: CheckedContinuation<Bool, Never>?
 
+    init() {
+        // If iOS ended the app mid-export, the file being staged is still
+        // there, and it can be gigabytes.
+        try? FileManager.default.removeItem(at: Self.stagingFolder)
+    }
+
     var isBusy: Bool {
         switch state {
         case .preparing, .running, .checking, .moving, .deleting, .askingICloud: true
@@ -94,6 +102,7 @@ final class Exporter: ObservableObject {
             var zip: URL?
             do {
                 let items = Self.items(photos: photos, videos: videos, saver: saver, folders: folders)
+                try Task.checkCancellation()
                 let staging = try Self.makeStaging()
                 defer { try? FileManager.default.removeItem(at: staging) }
                 zip = Self.newZipURL(Self.exportName(for: items))
@@ -103,6 +112,7 @@ final class Exporter: ObservableObject {
                 }
                 var manifest = part.manifest
                 manifest.fileRoots = folders.map(\.url)
+                manifest.expectedFiles = Self.filesPerPhoto(items)
                 var skipped = part.skipped
                 var leftInICloud: [ExportItem] = []
 
@@ -135,9 +145,11 @@ final class Exporter: ObservableObject {
                 let checked = try DriveTransfer.verifyZip(zip!) { done, total, current in
                     Task { @MainActor in self?.show(.checking(part: 0, done: done, total: total, current: current)) }
                 }
+                let inZip = Array(manifest.assetPaths.values.joined()) + manifest.files.keys
                 outcome = .finished(Result(zip: zip!, bytes: Self.fileSize(zip!),
                                            skipped: skipped.count, inICloud: inICloud.count,
-                                           manifest: manifest, checkedInZip: checked))
+                                           manifest: manifest, checkedInZip: checked,
+                                           damaged: inZip.filter { !checked.contains($0) }.count))
             } catch is CancellationError {
                 if let zip { try? FileManager.default.removeItem(at: zip) }
                 outcome = .idle
@@ -164,10 +176,12 @@ final class Exporter: ObservableObject {
             var cancelled = false
             do {
                 let items = Self.items(photos: photos, videos: videos, saver: saver, folders: folders)
+                try Task.checkCancellation()
                 let name = Self.exportName(for: items)
                 let folder = try DriveTransfer.makeFolder(named: name, on: drive)
                 summary = DriveSummary(folder: folder, driveAccess: drive)
                 summary!.manifest.fileRoots = folders.map(\.url)
+                summary!.manifest.expectedFiles = Self.filesPerPhoto(items)
                 let staging = try Self.makeStaging()
                 defer { try? FileManager.default.removeItem(at: staging) }
 
@@ -192,8 +206,16 @@ final class Exporter: ObservableObject {
 
                         // Check the zip itself first: if the drive won't take
                         // the files, a checked zip left on the phone still counts.
-                        let inZip = try DriveTransfer.verifyZip(part.zip) { done, total, current in
-                            Task { @MainActor in self?.show(.checking(part: number, done: done, total: total, current: current)) }
+                        let inZip: Set<String>
+                        do {
+                            inZip = try DriveTransfer.verifyZip(part.zip) { done, total, current in
+                                Task { @MainActor in self?.show(.checking(part: number, done: done, total: total, current: current)) }
+                            }
+                        } catch {
+                            // Cancelled or unreadable: an unchecked zip must not
+                            // stay behind looking like a finished export.
+                            try? FileManager.default.removeItem(at: part.zip)
+                            throw error
                         }
                         func keepZip(except copied: Set<String>) {
                             for path in inZip where !copied.contains(path) { summary!.keptInZips[path] = part.zip }
@@ -280,7 +302,7 @@ final class Exporter: ObservableObject {
             do {
                 folder = try DriveTransfer.makeFolder(named: result.zip.deletingPathExtension().lastPathComponent, on: drive)
                 let copy = try DriveTransfer.copy(zip: result.zip, into: folder!) { done, total, current in
-                    Task { @MainActor in self?.state = .moving(part: 0, done: done, total: total, current: current) }
+                    Task { @MainActor in self?.show(.moving(part: 0, done: done, total: total, current: current)) }
                 }
                 var summary = DriveSummary(folder: folder!, parts: 1, manifest: result.manifest,
                                            verified: copy.verified, failed: copy.failed,
@@ -347,9 +369,11 @@ final class Exporter: ObservableObject {
         }
     }
 
-    /// Progress updates arrive a moment late; one must never cover the question.
+    /// Progress updates arrive a moment late; one must never cover the
+    /// question, or the result of a job that has already ended.
     private func show(_ progress: State) {
         if case .askingICloud = state { return }
+        guard isBusy else { return }
         state = progress
     }
 
@@ -453,6 +477,15 @@ final class Exporter: ObservableObject {
         let pathInZip: String
         /// True when this is a re-encoded, lower-quality copy.
         let shrunk: Bool
+        /// For a document: when it was last changed, as it was copied.
+        var changed: Date? = nil
+    }
+
+    /// How many files each photo has to export (still, Live Photo video, RAW...).
+    private nonisolated static func filesPerPhoto(_ items: [ExportItem]) -> [String: Int] {
+        var counts: [String: Int] = [:]
+        for case .photoResource(let photo) in items { counts[photo.assetID, default: 0] += 1 }
+        return counts
     }
 
     private nonisolated static func items(photos: Bool, videos: Bool, saver: SpaceSaver?,
@@ -518,8 +551,11 @@ final class Exporter: ObservableObject {
         return zipURL
     }
 
+    private nonisolated static let stagingFolder =
+        FileManager.default.temporaryDirectory.appendingPathComponent("staging", isDirectory: true)
+
     private nonisolated static func makeStaging() throws -> URL {
-        let staging = FileManager.default.temporaryDirectory.appendingPathComponent("staging", isDirectory: true)
+        let staging = stagingFolder
         try? FileManager.default.removeItem(at: staging)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
         return staging
@@ -579,8 +615,9 @@ final class Exporter: ObservableObject {
                     throw PhoneFull()
                 }
                 let fetched = staging.appendingPathComponent(UUID().uuidString)
+                let changed: Date?
                 do {
-                    try await fetch(item, to: fetched)
+                    changed = try await fetch(item, to: fetched)
                 } catch {
                     try? FileManager.default.removeItem(at: fetched)
                     if isOutOfSpace(error) {
@@ -598,7 +635,14 @@ final class Exporter: ObservableObject {
                     index += 1
                     continue
                 }
-                prepared = try await shrinkIfAsked(item, fetched, staging: staging)
+                var ready = try await shrinkIfAsked(item, fetched, staging: staging)
+                ready.changed = changed
+                // The exported file is dated when the photo was taken, not now;
+                // the zip, and the copy on the drive, take their date from it.
+                if case .photoResource(let photo) = item, let taken = photo.taken {
+                    try? FileManager.default.setAttributes([.modificationDate: taken], ofItemAtPath: ready.url.path)
+                }
+                prepared = ready
             }
             let temp = prepared.url
 
@@ -625,10 +669,12 @@ final class Exporter: ObservableObject {
                 case .photoResource(let photo):
                     try archive.addEntry(with: prepared.pathInZip, fileURL: temp, compressionMethod: .none)
                     manifest.assetPaths[photo.assetID, default: []].append(prepared.pathInZip)
+                    manifest.assetDates[photo.assetID] = photo.modified
                     if prepared.shrunk { manifest.shrunkAssets.insert(photo.assetID) }
                 case .file(let url, let pathInZip):
                     try archive.addEntry(with: pathInZip, fileURL: temp, compressionMethod: .deflate)
                     manifest.files[pathInZip] = url
+                    manifest.fileDates[pathInZip] = prepared.changed
                 }
             } catch {
                 try? FileManager.default.removeItem(at: temp)
@@ -697,10 +743,14 @@ final class Exporter: ObservableObject {
         return Prepared(url: temp, pathInZip: photo.fallbackPath ?? photo.pathInZip, shrunk: false)
     }
 
-    private nonisolated static func fetch(_ item: ExportItem, to temp: URL) async throws {
+    /// Returns, for a document, when it was last changed.
+    private nonisolated static func fetch(_ item: ExportItem, to temp: URL) async throws -> Date? {
         switch item {
-        case .photoResource(let photo): try await PhotoSource.write(photo, to: temp)
-        case .file(let url, _): try FolderSource.copy(url, to: temp)
+        case .photoResource(let photo):
+            try await PhotoSource.write(photo, to: temp)
+            return nil
+        case .file(let url, _):
+            return try FolderSource.copy(url, to: temp)
         }
     }
 

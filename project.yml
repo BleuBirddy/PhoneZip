@@ -24,6 +24,9 @@ targets:
   PhoneZip:
     type: application
     platform: iOS
+    scheme:
+      testTargets:
+        - PhoneZipTests
     sources:
       - path: PhoneZip
     dependencies:
@@ -36,9 +39,25 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: PhoneZip
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "PhoneZip reads your photos and videos to copy them into a zip file you export. Nothing is uploaded."
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "PhoneZip reads your photos and videos to copy them into a zip file or onto a drive, and deletes the copied ones from this iPhone only if you ask it to. Nothing is uploaded."
         # Finished zips show up in Files > On My iPhone > PhoneZip, which is
         # the reliable way to move multi-GB files off (AirDrop, USB, Finder).
         INFOPLIST_KEY_UIFileSharingEnabled: YES
         INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        # An iPad app must support every orientation, or App Store upload is refused.
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        # Only Apple's own HTTPS/file encryption; skips the export question on every upload.
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+
+  PhoneZipTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: PhoneZipTests
+    dependencies:
+      - target: PhoneZip
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.jey.phonezip.tests
+        GENERATE_INFOPLIST_FILE: YES

@@ -138,6 +138,11 @@ enum DriveTransfer {
                 failed.append("\(entry.path): unsafe path in zip")
                 continue
             }
+            // Never write over, or later clean up, a file that was already there.
+            guard !FileManager.default.fileExists(atPath: dest.path) else {
+                failed.append("\(entry.path): a file with that name is already on the drive")
+                continue
+            }
             do {
                 try makeParents(of: dest, in: folder, recording: &created)
                 created.append(dest)
@@ -152,6 +157,9 @@ enum DriveTransfer {
                 // A drive that went away fails every file after it; stop and
                 // say so, instead of listing each file as a bad copy.
                 if !isReachable(folder) { throw DriveGone() }
+                // A bad or half-written copy must not stay on the drive,
+                // where it would pass for the backup of that file.
+                try? FileManager.default.removeItem(at: dest)
                 failed.append("\(entry.path): \(error.localizedDescription)")
             }
         }
@@ -246,9 +254,16 @@ enum DriveTransfer {
         _ = fcntl(handle.fileDescriptor, F_NOCACHE, 1)
         var crc: CRC32 = 0
         var size: UInt64 = 0
-        while let chunk = try handle.read(upToCount: 4 << 20), !chunk.isEmpty {
-            crc = chunk.crc32(checksum: crc)
-            size += UInt64(chunk.count)
+        // Each chunk is freed as soon as it is counted; without the pool a
+        // multi-gigabyte video can pile up in memory until iOS ends the app.
+        var more = true
+        while more {
+            more = try autoreleasepool {
+                guard let chunk = try handle.read(upToCount: 4 << 20), !chunk.isEmpty else { return false }
+                crc = chunk.crc32(checksum: crc)
+                size += UInt64(chunk.count)
+                return true
+            }
         }
         return (crc, size)
     }
@@ -259,13 +274,28 @@ enum DriveTransfer {
     /// quality. Anything Save Space re-encoded is never deleted.
     static func deletableAssets(_ manifest: ExportManifest, verified: Set<String>) -> [String] {
         manifest.assetPaths.compactMap { id, paths in
+            // Every file the photo has must have been exported: an export that
+            // stopped early may have copied a Live Photo's still but not its video.
             !manifest.incompleteAssets.contains(id) && !manifest.shrunkAssets.contains(id)
+                && paths.count == manifest.expectedFiles[id]
                 && paths.allSatisfy(verified.contains) ? id : nil
         }
     }
 
+    /// Each document once, even when it was exported twice (the same folder
+    /// picked twice, or a folder and one inside it).
     static func deletableFiles(_ manifest: ExportManifest, verified: Set<String>) -> [URL] {
-        manifest.files.compactMap { path, url in verified.contains(path) ? url : nil }
+        var seen = Set<String>()
+        return manifest.files.compactMap { path, url in
+            verified.contains(path) && seen.insert(url.standardizedFileURL.path).inserted ? url : nil
+        }
+    }
+
+    /// True when something was changed after the date recorded at export.
+    /// With no recorded date there is nothing to compare, so it counts as unchanged.
+    static func isNewer(_ now: Date?, than recorded: Date?) -> Bool {
+        guard let now, let recorded else { return false }
+        return abs(now.timeIntervalSince(recorded)) > 0.001
     }
 
     /// `checked` are the paths with a checked copy: on the drive in `folder`,
@@ -288,8 +318,33 @@ enum DriveTransfer {
 
         let ids = deletableAssets(manifest, verified: verified)
         if !ids.isEmpty {
-            let assets = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
-            do {
+            // Photos synced from a computer can't be deleted on the phone, and
+            // a single one of them makes iOS refuse the whole request.
+            var assets: [PHAsset] = []
+            var locked = 0
+            var edited = 0
+            // Hidden photos and burst frames were exported, so they must be found here too.
+            let options = PHFetchOptions()
+            options.includeHiddenAssets = true
+            options.includeAllBurstAssets = true
+            PHAsset.fetchAssets(withLocalIdentifiers: ids, options: options).enumerateObjects { asset, _, _ in
+                if !asset.canPerform(.delete) {
+                    locked += 1
+                } else if isNewer(asset.modificationDate, than: manifest.assetDates[asset.localIdentifier]) {
+                    edited += 1
+                } else {
+                    assets.append(asset)
+                }
+            }
+            if edited > 0 {
+                report.problems.append(edited == 1
+                    ? "1 photo or video was changed after it was copied, so it was kept. Export again to copy the new version."
+                    : "\(edited) photos and videos were changed after they were copied, so they were kept. Export again to copy the new versions.")
+            }
+            if locked > 0 {
+                report.problems.append("\(locked) photo(s) can't be deleted on this iPhone (synced from a computer), so they were kept.")
+            }
+            if !assets.isEmpty { do {
                 // iOS shows its own "Allow PhoneZip to delete N photos?" prompt
                 // here; apps can't skip it. Deleted photos go to Recently Deleted.
                 try await PHPhotoLibrary.shared().performChanges {
@@ -302,11 +357,19 @@ enum DriveTransfer {
                 } else {
                     report.problems.append("Photos: \(error.localizedDescription)")
                 }
-            }
+            } }
         }
 
+        // A document edited after it was copied is newer than its copy.
+        var datesByFile: [String: Date] = [:]
+        for (path, url) in manifest.files { datesByFile[url.standardizedFileURL.path] = manifest.fileDates[path] }
+        var changed = 0
         var emptied = Set<URL>()
         for url in deletableFiles(manifest, verified: verified) {
+            if isNewer(FolderSource.modificationDate(url), than: datesByFile[url.standardizedFileURL.path]) {
+                changed += 1
+                continue
+            }
             do {
                 try delete(url)
                 report.filesDeleted += 1
@@ -314,6 +377,11 @@ enum DriveTransfer {
             } catch {
                 report.problems.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
+        }
+        if changed > 0 {
+            report.problems.append(changed == 1
+                ? "1 file was changed after it was copied, so it was kept. Export again to copy the new version."
+                : "\(changed) files were changed after they were copied, so they were kept. Export again to copy the new versions.")
         }
         removeEmptyFolders(emptied, inside: manifest.fileRoots)
         return report

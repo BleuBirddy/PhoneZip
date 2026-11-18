@@ -14,6 +14,11 @@ enum PhotoSource {
         /// Which photo this file belongs to, so the photo is only deleted from
         /// the phone once every one of its files is safely on the drive.
         let assetID: String
+        /// When the photo was taken. The exported file gets this date, not
+        /// the moment of the export.
+        var taken: Date? = nil
+        /// When the photo was last changed (edited, cropped, favorited...).
+        var modified: Date? = nil
         /// Set in Save Space mode: re-encode this file before zipping it.
         var shrink: Shrinker.Kind? = nil
         /// Where the untouched file goes if re-encoding fails. A shrunk photo
@@ -45,6 +50,11 @@ enum PhotoSource {
     private static func libraryOnly() -> PHFetchOptions {
         let options = PHFetchOptions()
         options.includeAssetSourceTypes = [.typeUserLibrary, .typeiTunesSynced]
+        // The same set the export walks, so the counts on screen match it:
+        // hidden photos, and every frame of a burst (by default only the
+        // burst's cover photo is returned, and the rest would be left out).
+        options.includeHiddenAssets = true
+        options.includeAllBurstAssets = true
         return options
     }
 
@@ -63,7 +73,6 @@ enum PhotoSource {
     static func items(photos: Bool, videos: Bool, saver: SpaceSaver?, paths: inout ZipPathAllocator) -> [Item] {
         let options = libraryOnly()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
-        options.includeHiddenAssets = true
         var types: [Int] = []
         if photos { types.append(PHAssetMediaType.image.rawValue) }
         if videos { types.append(PHAssetMediaType.video.rawValue) }
@@ -79,12 +88,14 @@ enum PhotoSource {
         let assets = PHAsset.fetchAssets(with: options)
         var result: [Item] = []
         for index in 0..<assets.count {
+            // Listing a big library takes a while; Cancel must work meanwhile.
+            if Task.isCancelled { break }
             let asset = assets.object(at: index)
             let kind = "Photo Library/" + kindFolder(for: asset)
             let folder = kind + "/" + (asset.creationDate.map { folderFormat.string(from: $0) } ?? "Undated")
             for (resource, name) in exportResources(for: asset) {
                 let original = "\(folder)/\(name)"
-                let item: Item
+                var item: Item
                 switch saver.flatMap({ shrinkKind(resource, $0) }) {
                 case .photo:
                     let heic = (original as NSString).deletingPathExtension + ".HEIC"
@@ -96,6 +107,8 @@ enum PhotoSource {
                 case nil:
                     item = Item(resource: resource, pathInZip: paths.unique(original), assetID: asset.localIdentifier)
                 }
+                item.taken = asset.creationDate
+                item.modified = asset.modificationDate
                 result.append(item)
             }
         }
