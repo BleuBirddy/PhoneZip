@@ -24,7 +24,7 @@ final class PickedFolder: Identifiable {
     /// recognized by its on-disk name.
     var name: String {
         let localized = (try? url.resourceValues(forKeys: [.localizedNameKey]).localizedName) ?? url.lastPathComponent
-        return localized == "File Provider Storage" ? "On My \(UIDevice.current.model)" : localized
+        return localized == "File Provider Storage" ? "On My \(Device.name)" : localized
     }
 }
 
@@ -93,10 +93,10 @@ enum FolderSource {
             location = "iCloud Drive"          // an app's iCloud folder
             path = [folder.name]
         } else if let rest = below("File Provider Storage") {
-            location = "On My \(UIDevice.current.model)"
+            location = "On My \(Device.name)"
             path = rest
         } else if parts.contains("Containers") {
-            location = "On My \(UIDevice.current.model)"   // an app's own folder
+            location = "On My \(Device.name)"   // an app's own folder
             path = [folder.name]
         } else {
             // A USB drive or another volume: its name, then the path on it.

@@ -342,7 +342,7 @@ enum DriveTransfer {
                     : "\(edited) photos and videos were changed after they were copied, so they were kept. Export again to copy the new versions.")
             }
             if locked > 0 {
-                report.problems.append("\(locked) photo(s) can't be deleted on this iPhone (synced from a computer), so they were kept.")
+                report.problems.append("\(locked) photo(s) can't be deleted on this \(Device.name) (synced from a computer), so they were kept.")
             }
             if !assets.isEmpty { do {
                 // iOS shows its own "Allow PhoneZip to delete N photos?" prompt

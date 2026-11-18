@@ -410,13 +410,13 @@ final class Exporter: ObservableObject {
 
     struct OutOfSpace: LocalizedError {
         var errorDescription: String? {
-            "The iPhone ran out of space. A zip kept on the phone needs about as much free space as the photos and files it holds. Use Copy to Drive instead: it goes in parts and only needs room for one part at a time."
+            "This \(Device.name) ran out of space. A zip kept on it needs about as much free space as the photos and files it holds. Use Copy to Drive instead: it goes in parts and only needs room for one part at a time."
         }
     }
 
     struct PhoneFull: LocalizedError {
         var errorDescription: String? {
-            "The iPhone is almost full, even without a zip on it. Free up some space and try again."
+            "This \(Device.name) is almost full, even without a zip on it. Free up some space and try again."
         }
     }
 
@@ -511,7 +511,7 @@ final class Exporter: ObservableObject {
         if case .photoResource(let photo) = item { manifest.incompleteAssets.insert(photo.assetID) }
     }
 
-    /// "iPhone Export 2024-05-01 18.30 - Photos, Videos & Documents": the
+    /// "iPhone Export 2024-05-01 18.30 - Photos, Videos & Documents" ("iPad Export" on an iPad): the
     /// name says what is inside, taken from what was actually found.
     private nonisolated static func exportName(for items: [ExportItem]) -> String {
         let stamp = DateFormatter()
@@ -536,7 +536,7 @@ final class Exporter: ObservableObject {
         case 1: contents = " - " + ordered[0]
         default: contents = " - " + ordered.dropLast().joined(separator: ", ") + " & " + ordered.last!
         }
-        return "iPhone Export \(stamp.string(from: Date()))\(contents)"
+        return "\(Device.name) Export \(stamp.string(from: Date()))\(contents)"
     }
 
     /// Never reuses a name: two exports in the same minute must not replace
@@ -624,7 +624,7 @@ final class Exporter: ObservableObject {
                         if !inParts { throw OutOfSpace() }
                         // Try it again in the next part, once this zip is off the phone.
                         if hasEntries { break }
-                        skip(item, "too big for the free space on this iPhone")
+                        skip(item, "too big for the free space on this \(Device.name)")
                     } else if PhotoSource.isICloudOnly(error) {
                         // Never downloaded without asking: held back until
                         // the rest is done, then the user decides.
@@ -657,7 +657,7 @@ final class Exporter: ObservableObject {
                     break
                 }
                 try? FileManager.default.removeItem(at: temp)
-                skip(item, "too big for the free space on this iPhone")
+                skip(item, "too big for the free space on this \(Device.name)")
                 index += 1
                 continue
             }
